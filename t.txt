@@ -1,0 +1,51 @@
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/login')
+def login_page():
+    return render_template('login.html')
+
+@app.route('/register')
+def register_page():
+    return render_template('register.html')
+
+@app.route('/dashboard')
+@jwt_required()
+def dashboard_page():
+    return render_template('dashboard.html')
+
+return render_template('register.html')
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Check if we're on the dashboard page
+  if (document.getElementById('dashboardContent')) {
+    initializeDashboard();
+  }
+  
+  // Set up form event listeners
+  if (document.getElementById('loginForm')) {
+    document.getElementById('loginForm').addEventListener('submit', handleLogin);
+  }
+  
+  if (document.getElementById('registerForm')) {
+    document.getElementById('registerForm').addEventListener('submit', handleRegister);
+  }
+  
+  if (document.getElementById('uploadForm')) {
+    document.getElementById('uploadForm').addEventListener('submit', handleFileUpload);
+  }
+  
+  // If we have a token and we're not on the dashboard, redirect to dashboard
+  if (token && !document.getElementById('dashboardContent')) {
+    window.location.href = 'dashboard.html';
+  }
+});
+
+
+options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      scales: { y: { beginAtZero: true } },
+    }
+});
