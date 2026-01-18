@@ -1,0 +1,37 @@
+# Core Flask & Web Framework
+Flask==2.3.3
+Werkzeug==2.3.7
+Jinja2==3.1.2
+
+# Database & ORM
+Flask-SQLAlchemy==3.0.5
+SQLAlchemy==2.0.23
+
+# Authentication & Security
+Flask-JWT-Extended==4.5.3
+Werkzeug==2.3.7  # Already included for password hashing
+Flask-CORS==4.0.0
+
+# Data Processing & Analysis
+pandas==2.0.3
+numpy==1.24.3
+
+# Data Visualization
+matplotlib==3.7.2
+seaborn==0.12.2
+
+# PDF Generation
+reportlab==4.0.4
+
+# File Processing
+openpyxl==3.1.2  # For Excel file support
+xlrd==2.0.1      # For older Excel formats
+
+# Production Server
+gunicorn==21.2.0
+
+# Development Tools (optional)
+python-dotenv==1.0.0  
+
+# Additional Utilities
+requests==2.31.0  
