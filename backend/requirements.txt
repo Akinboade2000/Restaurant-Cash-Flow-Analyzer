@@ -9,7 +9,7 @@ SQLAlchemy==2.0.23
 
 # Authentication & Security
 Flask-JWT-Extended==4.5.3
-Werkzeug==2.3.7  # Already included for password hashing
+Werkzeug==2.3.7  
 Flask-CORS==4.0.0
 
 # Data Processing & Analysis
@@ -34,4 +34,5 @@ gunicorn==21.2.0
 python-dotenv==1.0.0  
 
 # Additional Utilities
+
 requests==2.31.0  
