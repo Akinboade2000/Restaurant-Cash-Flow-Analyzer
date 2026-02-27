@@ -7,7 +7,6 @@
 
 A powerful, interactive web-based tool designed to help Small and Medium Enterprises (SMEs) visualize, analyze, and optimize their cash flow through intuitive graphical representations and automated anomaly detection.
 
-![Dashboard Preview](screenshots/dashboard.png)
 
 ## 📋 Table of Contents
 - [Overview](#overview)
