@@ -1,1314 +1,465 @@
-// Global state
-let token = localStorage.getItem('token') || '';
-let restaurants = [];
-let selectedRestaurant = '';
-let visualizations = null;
-let anomalies = [];
-let epsDividendChart = null;
-let exchangeRateRefreshInterval = null;
+const naira = new Intl.NumberFormat("en-NG", {
+  style: "currency",
+  currency: "NGN",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+const compactNaira = new Intl.NumberFormat("en-NG", {
+  style: "currency",
+  currency: "NGN",
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+const charts = {};
+let selectedRestaurant = "";
 
-// Chart instances
-let waterfallChart = null;
-let revenueChart = null;
-let expenseChart = null;
-let trendsChart = null;
-let detailedRevenueChart = null;
-let companyFranchiseChart = null;
-let profitabilityChart = null;
-
-// Initialize the app when the DOM is loaded
-document.addEventListener('DOMContentLoaded', function() {
-  const loginForm = document.getElementById('loginForm');
-  if (loginForm) {
-    loginForm.addEventListener('submit', handleLogin);
-  }
-  const registerForm = document.getElementById('registerForm');
-  if (registerForm) {
-    registerForm.addEventListener('submit', handleRegister);
-  }
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("loginForm")?.addEventListener("submit", handleLogin);
+  document.getElementById("registerForm")?.addEventListener("submit", handleRegister);
+  document.getElementById("dashboardContent") && initializeDashboard();
 });
 
+async function requestJson(url, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  const csrfToken = getCookie("csrf_access_token");
+  if (method !== "GET" && csrfToken) headers.set("X-CSRF-TOKEN", csrfToken);
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...options,
+    headers,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    window.location.assign("/login");
+    throw new Error("Please sign in to continue.");
+  }
+  if (!response.ok) {
+    throw new Error(data.message || `Request failed (${response.status}).`);
+  }
+  return data;
+}
 
-document.getElementById('uploadForm').addEventListener('submit', handleFileUpload);
+function showAuthError(message) {
+  const error = document.getElementById("errorMessage");
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = false;
+}
 
-
-
-async function initializeDashboard() {
+async function handleLogin(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  button.disabled = true;
   try {
-    // Verify auth by making a simple request
-    const response = await fetch('/api/verify-auth', {
-      credentials: 'include'
+    await requestJson("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+      }),
     });
-    
-    if (!token) {
-      window.location.href = '/login';
-      return;
-    }
-    
-  
+    window.location.assign("/dashboard");
   } catch (error) {
-    console.error('Auth check failed:', error);
-    window.location.href = '/login';
+    showAuthError(error.message);
+  } finally {
+    button.disabled = false;
   }
 }
 
-// Navigation functions
-function navigateTo(page) {
-  window.location.href = `/${page}`;  
+async function handleRegister(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    await requestJson("/api/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("regUsername").value,
+        email: document.getElementById("regEmail").value,
+        password: document.getElementById("regPassword").value,
+      }),
+    });
+    window.location.assign("/login");
+  } catch (error) {
+    showAuthError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function initializeDashboard() {
+  try {
+    await requestJson("/api/verify-auth");
+    await loadRestaurants();
+    document.getElementById("restaurantSelect").addEventListener("change", async (event) => {
+      selectedRestaurant = event.target.value;
+      await loadAnalysis();
+    });
+    document.getElementById("restaurantForm").addEventListener("submit", addRestaurant);
+    document.getElementById("uploadForm").addEventListener("submit", handleFileUpload);
+    document.getElementById("downloadReport").addEventListener("click", downloadReport);
+    document.getElementById("exportTransactions").addEventListener("click", exportTransactions);
+    document.getElementById("logoutButton").addEventListener("click", logout);
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+  }
+}
+
+async function loadRestaurants() {
+  let restaurants = await requestJson("/api/restaurants");
+  if (!restaurants.length) {
+    await requestJson("/api/restaurants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "My Restaurant" }),
+    });
+    restaurants = await requestJson("/api/restaurants");
+  }
+
+  const select = document.getElementById("restaurantSelect");
+  select.replaceChildren();
+  restaurants.forEach((restaurant) => {
+    const option = document.createElement("option");
+    option.value = restaurant.id;
+    option.textContent = restaurant.name;
+    select.append(option);
+  });
+  selectedRestaurant = restaurants[0].id;
+  select.value = selectedRestaurant;
+  await loadAnalysis();
+}
+
+async function addRestaurant(event) {
+  event.preventDefault();
+  const input = document.getElementById("restaurantName");
+  try {
+    const restaurant = await requestJson("/api/restaurants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: input.value }),
+    });
+    input.value = "";
+    await loadRestaurants();
+    document.getElementById("restaurantSelect").value = restaurant.id;
+    selectedRestaurant = restaurant.id;
+    await loadAnalysis();
+    showDashboardMessage("Restaurant added.", "success");
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+  }
+}
+
+async function loadAnalysis() {
+  if (!selectedRestaurant) return;
+  try {
+    const data = await requestJson(
+      `/api/visualizations?restaurant_id=${encodeURIComponent(selectedRestaurant)}`,
+    );
+    renderAnalysis(data);
+    showDashboardMessage("", "");
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+    renderAnalysis(null);
+  }
+}
+
+function renderAnalysis(data) {
+  const waterfall = data?.waterfall || { revenue: 0, expenses: 0, net_cash: 0 };
+  const summary = data?.statistical_summary || {};
+  const revenue = waterfall.revenue || 0;
+  const netCash = waterfall.net_cash || 0;
+  document.getElementById("totalRevenue").textContent = naira.format(revenue);
+  document.getElementById("totalExpenses").textContent = naira.format(waterfall.expenses || 0);
+  document.getElementById("netIncome").textContent = naira.format(netCash);
+  document.getElementById("profitMargin").textContent =
+    `${revenue ? ((netCash / revenue) * 100).toFixed(2) : "0.00"}%`;
+  document.getElementById("avgMonthlyRevenue").textContent =
+    naira.format(summary.avg_monthly_revenue || 0);
+  document.getElementById("revenueGrowthRate").textContent =
+    summary.revenue_growth_rate == null ? "Not available" : `${summary.revenue_growth_rate.toFixed(2)}%`;
+  document.getElementById("expenseToRevenue").textContent =
+    `${(summary.expense_to_revenue_ratio || 0).toFixed(2)}%`;
+  document.getElementById("anomalyPercentage").textContent =
+    `${summary.anomaly_count || 0} (${(summary.anomaly_percentage || 0).toFixed(2)}%)`;
+  document.getElementById("anomalyFootnote").textContent =
+    `${summary.transaction_count || 0} transactions analyzed`;
+  document.getElementById("anomalyCount").textContent =
+    `${summary.anomaly_count || 0} flagged`;
+
+  renderCashFlowChart(data?.monthly_trends, data?.anomalies || []);
+  renderCategoryChart("revenueChart", data?.revenue_breakdown || {}, "#21865b");
+  renderCategoryChart("expenseChart", data?.expense_breakdown || {}, "#e28559");
+  renderAnomalies(data?.anomalies || [], summary.transaction_count || 0);
+}
+
+function renderCashFlowChart(trends = {}, anomalies = []) {
+  const labels = trends.months || [];
+  const largestAnomalyByMonth = new Map();
+  anomalies.forEach((anomaly) => {
+    const month = anomaly.date.slice(0, 7);
+    const amount = Number(anomaly.amount_ngn);
+    largestAnomalyByMonth.set(month, Math.max(largestAnomalyByMonth.get(month) || 0, amount));
+  });
+  drawChart("cashFlowChart", {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Revenue",
+          data: trends.revenue || [],
+          borderColor: "#21865b",
+          backgroundColor: "rgba(33, 134, 91, 0.12)",
+          fill: true,
+          tension: 0.32,
+        },
+        {
+          label: "Expenses",
+          data: trends.expense || [],
+          borderColor: "#e28559",
+          backgroundColor: "rgba(226, 133, 89, 0.10)",
+          fill: true,
+          tension: 0.32,
+        },
+        {
+          label: "Net cash flow",
+          data: trends.net_cash || [],
+          borderColor: "#5076ad",
+          borderDash: [5, 4],
+          tension: 0.32,
+        },
+        {
+          label: "Largest flagged transaction",
+          data: labels.map((month) => largestAnomalyByMonth.get(month) || null),
+          showLine: false,
+          pointRadius: 7,
+          pointHoverRadius: 9,
+          pointBackgroundColor: "#bd5948",
+          pointBorderColor: "#fff",
+          pointBorderWidth: 2,
+        },
+      ],
+    },
+    options: chartOptions(true),
+  });
+}
+
+function renderCategoryChart(canvasId, breakdown, color) {
+  const entries = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
+  const options = chartOptions(false);
+  options.indexAxis = "y";
+  options.scales.x.beginAtZero = true;
+  options.scales.x.ticks.callback = (value) => compactNaira.format(value);
+  options.scales.y.beginAtZero = false;
+  options.scales.y.ticks = { color: "#738078" };
+  drawChart(canvasId, {
+    type: "bar",
+    data: {
+      labels: entries.map(([label]) => label),
+      datasets: [{
+        label: "Amount",
+        data: entries.map(([, amount]) => amount),
+        backgroundColor: color,
+        borderRadius: 5,
+        maxBarThickness: 26,
+      }],
+    },
+    options,
+  });
+}
+
+function chartOptions(showLegend) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: "index", intersect: false },
+    plugins: {
+      legend: { display: showLegend, position: "bottom", labels: { usePointStyle: true, boxWidth: 7 } },
+      tooltip: {
+        callbacks: { label: (context) => `${context.dataset.label || ""} ${naira.format(context.raw)}` },
+      },
+    },
+    scales: {
+      x: {
+        grid: { display: false },
+        ticks: { color: "#738078" },
+      },
+      y: {
+        beginAtZero: true,
+        grid: { color: "rgba(28, 62, 45, 0.07)" },
+        ticks: {
+          color: "#738078",
+          callback: (value) => compactNaira.format(value),
+        },
+      },
+    },
+  };
+}
+
+function drawChart(canvasId, configuration) {
+  if (charts[canvasId]) charts[canvasId].destroy();
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || typeof Chart === "undefined") return;
+  charts[canvasId] = new Chart(canvas, configuration);
+}
+
+function renderAnomalies(anomalies, transactionCount) {
+  const table = document.getElementById("anomaliesTable");
+  table.replaceChildren();
+  if (!anomalies.length) {
+    const row = table.insertRow();
+    const cell = row.insertCell();
+    cell.colSpan = 6;
+    cell.className = "empty-state";
+    cell.textContent = transactionCount
+      ? "No unusual transactions flagged. Keep reviewing as your data grows."
+      : "Import transactions to see analysis.";
+    return;
+  }
+
+  anomalies.forEach((anomaly) => {
+    const row = table.insertRow();
+    const values = [
+      new Date(anomaly.date).toLocaleDateString("en-NG"),
+      anomaly.category,
+      anomaly.type,
+      `${anomaly.currency} ${Number(anomaly.amount).toLocaleString("en-NG", { maximumFractionDigits: 2 })}`,
+      naira.format(anomaly.amount_ngn),
+      anomaly.reason,
+    ];
+    values.forEach((value) => {
+      const cell = row.insertCell();
+      cell.textContent = value;
+    });
+  });
+}
+
+async function handleFileUpload(event) {
+  event.preventDefault();
+  const fileInput = document.getElementById("fileInput");
+  const button = document.getElementById("uploadButton");
+  if (!fileInput.files.length) {
+    showDashboardMessage("Choose a CSV or XLSX file first.", "error");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("file", fileInput.files[0]);
+  formData.append("restaurant_id", selectedRestaurant);
+  button.disabled = true;
+  button.textContent = "Analyzing...";
+  try {
+    const result = await requestJson("/api/upload", { method: "POST", body: formData });
+    selectedRestaurant = result.restaurant_id;
+    await loadAnalysis();
+    showDashboardMessage(result.message, "success");
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+  } finally {
+    fileInput.value = "";
+    button.disabled = false;
+    button.textContent = "Analyze data";
+  }
+}
+
+async function downloadReport() {
+  const button = document.getElementById("downloadReport");
+  button.disabled = true;
+  button.textContent = "Preparing PDF...";
+  try {
+    const response = await fetch("/api/generate_report", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-TOKEN": getCookie("csrf_access_token"),
+      },
+      body: JSON.stringify({ restaurant_id: selectedRestaurant }),
+    });
+    if (response.status === 401) {
+      window.location.assign("/login");
+      return;
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.message || `Report generation failed (${response.status}).`);
+    }
+    const pdf = await response.blob();
+    const objectUrl = URL.createObjectURL(pdf);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = `${(document.getElementById("restaurantSelect").selectedOptions[0]?.textContent || "restaurant")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-")}-cash-flow-analysis.pdf`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+    showDashboardMessage("Your analysis PDF has been downloaded.", "success");
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Download analysis PDF";
+  }
+}
+
+async function exportTransactions() {
+  const button = document.getElementById("exportTransactions");
+  button.disabled = true;
+  button.textContent = "Preparing CSV...";
+  try {
+    const response = await fetch(
+      `/api/restaurants/${encodeURIComponent(selectedRestaurant)}/transactions.csv`,
+      { credentials: "same-origin" },
+    );
+    if (response.status === 401) {
+      window.location.assign("/login");
+      return;
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.message || `CSV export failed (${response.status}).`);
+    }
+    const file = await response.blob();
+    const objectUrl = URL.createObjectURL(file);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = `${(document.getElementById("restaurantSelect").selectedOptions[0]?.textContent || "restaurant")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-")}-transactions.csv`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+    showDashboardMessage("Your transaction backup has been downloaded.", "success");
+  } catch (error) {
+    showDashboardMessage(error.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Back up transactions CSV";
+  }
 }
 
 async function logout() {
   try {
-    // Call backend logout endpoint
-    const response = await fetch('/api/logout', {
-      method: 'POST',
-      credentials: 'include'
-    });
-
-    // Clear frontend state
-    token = '';
-    localStorage.removeItem('token');
-    restaurants = [];
-    visualizations = null;
-    anomalies = [];
-
-    // Redirect to login page
-    window.location.href = '/login';
-    
-  } catch (error) {
-    console.error('Logout error:', error);
-    // Fallback redirect if logout fails
-    window.location.href = '/login';
-  }
-}
-
-// Auth functions
-async function handleLogin(e) {
-  e.preventDefault(); 
-  
-  const username = document.getElementById('username').value;
-  const password = document.getElementById('password').value;
-
-  try {
-    const response = await fetch('/api/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      credentials: 'include',
-      body: JSON.stringify({
-        username: username,
-        password: password
-      })
-    });
-
-    const data = await response.json();
-    
-    if (response.ok) {
-      window.location.href = '/dashboard'; // Redirect to dashboard
-    } else {
-      alert(data.message || 'Login failed');
-    }
-  } catch (error) {
-    console.error('Login error:', error);
-    alert('Failed to connect to server');
-  }
-}
-
-async function handleRegister(e) {
-  e.preventDefault(); // This is CRUCIAL: It stops the form from refreshing the page.
-  const username = document.getElementById('regUsername').value;
-  const email = document.getElementById('regEmail').value;
-  const password = document.getElementById('regPassword').value;
-
-  try {
-    const response = await fetch('/api/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, email, password })
-    });
-
-    const data = await response.json();
-    
-    if (response.ok) {
-      alert('Registration successful! Please login.');
-      window.location.href = '/login'; // Redirect to login page
-    } else {
-      // Show error message from server
-      const errorElement = document.getElementById('errorMessage');
-      errorElement.textContent = data.message || 'Registration failed';
-      errorElement.style.display = 'block';
-    }
-  } catch (error) {
-    console.error('Registration error:', error);
-    document.getElementById('errorMessage').textContent = 'Failed to connect to server';
-    document.getElementById('errorMessage').style.display = 'block';
-  }
-}
-
-// Dashboard functions
-async function initializeDashboard() {
-  if (!token) {
-    window.location.href = 'index.html';
-    return;
-  }
-}
-
-console.log("Currency system initialized");
-console.log("Current currency:", currentCurrency);
-console.log("Exchange rate:", exchangeRate);
-
-
-// Function to fetch exchange rate for specific currencies
-async function fetchExchangeRate(fromCurrency = 'USD', toCurrency = null) {
-  try {
-    const targetCurrency = toCurrency || currentCurrency;
-    console.log(`Fetching exchange rate from ${fromCurrency} to ${targetCurrency}`);
-    
-    const response = await fetch(`/api/exchange_rate?from=${fromCurrency}&to=${targetCurrency}`);
-    
-    if (response.ok) {
-      const data = await response.json();
-      exchangeRate = data.rate || 1500;
-      exchangeRateLastUpdated = data.last_updated || new Date().toISOString();
-      exchangeRateSource = data.source || 'unknown';
-      
-      console.log(`Exchange rate updated: 1 ${fromCurrency} = ${exchangeRate} ${targetCurrency} (source: ${exchangeRateSource})`);
-      return data;
-    } else {
-      // Use default rate if API fails
-      exchangeRate = fromCurrency === 'USD' && targetCurrency === 'NGN' ? 1500 : 1;
-      exchangeRateLastUpdated = new Date().toISOString();
-      exchangeRateSource = 'error_fallback';
-      console.warn('Failed to fetch exchange rate, using default');
-      return {rate: exchangeRate, last_updated: exchangeRateLastUpdated, source: exchangeRateSource};
-    }
-  } catch (error) {
-    console.error('Error fetching exchange rate:', error);
-    exchangeRate = fromCurrency === 'USD' && targetCurrency === 'NGN' ? 1500 : 1;
-    exchangeRateLastUpdated = new Date().toISOString();
-    exchangeRateSource = 'error_fallback';
-    return {rate: exchangeRate, last_updated: exchangeRateLastUpdated, source: exchangeRateSource};
-  }
-}
-
-async function initializeCurrencySystem() {
-  try {
-    // Set default currency
-    currentCurrency = 'NGN';
-    
-    // Fetch the latest exchange rate (USD to NGN)
-    await fetchExchangeRate('USD', 'NGN');
-    
-    // Update exchange rate info display
-    updateExchangeRateInfo();
-    
-    // Set the selector to the current currency
-    const selector = document.getElementById('currencySelector');
-    if (selector) {
-      selector.value = currentCurrency;
-    }
-    
-  } catch (error) {
-    console.error('Error initializing currency system:', error);
-  }
-}
-// Clean up interval when page is unloaded
-window.addEventListener('beforeunload', () => {
-  if (exchangeRateRefreshInterval) {
-    clearInterval(exchangeRateRefreshInterval);
-  }
-});
-
-async function fetchVisualizations(restaurantId) {
-    console.log("Fetching visualizations");
-    try {
-        const response = await fetch(
-            `/api/visualizations/?restaurant_id=${restaurantId}`,
-            { 
-                credentials: 'include',
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
-            }
-        );
-        
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        visualizations = data;
-        anomalies = data.anomalies || [];
-        
-        // Update summary cards
-        updateSummaryCards(data);
-        
-        // Update all charts
-        updateCharts();
-        
-        // Check if we have data for new charts
-        if (data.waterfall && data.waterfall.revenue > 0) {
-            updateNewCharts(data);
-        } else {
-            handleMissingData();
-        }
-        
-        updateAnomaliesTable();
-        
-    } catch (error) {
-        console.error('Error fetching visualizations:', error);
-        document.getElementById('anomaliesTable').innerHTML = 
-            `<p class="error">Error loading data: ${error.message}</p>`;
-        handleMissingData();
-    }
-}
-
-async function handleFileUpload(e) {
-  e.preventDefault();
-  const fileInput = document.getElementById('fileInput');
-  const file = fileInput.files[0];
-  const submitButton = e.target.querySelector('button[type="submit"]');
-  
-  if (!file) {
-    alert('Please select a file');
-    return;
-  }
-
-  // Check file type
-  if (!file.name.endsWith('.csv') && !file.name.endsWith('.xlsx')) {
-    alert('Please select a CSV or Excel file');
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append('file', file);
-  
-  try {
-    // Show loading state
-    submitButton.disabled = true;
-    submitButton.textContent = 'Uploading...';
-    
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      credentials: 'include',
-      body: formData,
-    });
-    
-    const data = await response.json();
-    
-    if (response.ok) {
-      if (data.error_count > 0) {
-        alert(`${data.message}\n\nErrors:\n${data.errors.join('\n')}`);
-      } else {
-        alert(data.message);
-      }
-      // Refresh visualizations with the restaurant_id from response
-      await fetchVisualizations(data.restaurant_id);
-    } else {
-      alert(data.message || 'Upload failed');
-    }
-  } catch (error) {
-    console.error('Upload error:', error);
-    alert('Failed to upload file. Please try again.');
+    await requestJson("/api/logout", { method: "POST" });
   } finally {
-    // Reset button state
-    submitButton.disabled = false;
-    submitButton.textContent = 'Upload';
-    // Clear file input
-    fileInput.value = '';
+    window.location.assign("/login");
   }
 }
 
-function formatCurrency(amount) {
-    return '$' + amount.toLocaleString('en-US', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-    });
+function showDashboardMessage(message, kind) {
+  const element = document.getElementById("dashboardMessage");
+  if (!element) return;
+  element.textContent = message;
+  element.className = `status-message${kind ? ` status-${kind}` : ""}`;
 }
 
-function updateNewCharts(data) {
-    // Check if we have data before creating charts
-    const hasData = data.waterfall && data.waterfall.revenue > 0;
-    
-    if (hasData) {
-        createDetailedRevenueChart(data);
-        createCompanyFranchiseChart(data);
-        createProfitabilityChart(data);
-        createEPSDividendChart(data);
-    } else {
-        // Show "no data" messages for all charts
-        showNoDataMessage('detailedRevenueChart');
-        showNoDataMessage('companyFranchiseChart');
-        showNoDataMessage('profitabilityChart');
-        showNoDataMessage('epsDividendChart');
-    }
-}
-
-function showNoDataMessage(chartId) {
-    const container = document.getElementById(chartId)?.closest('.chart-container');
-    if (container) {
-        const existingMessage = container.querySelector('.no-data-message');
-        if (!existingMessage) {
-            const message = document.createElement('p');
-            message.className = 'no-data-message';
-            message.textContent = 'Upload data to see this chart';
-            message.style.textAlign = 'center';
-            message.style.padding = '20px';
-            message.style.color = '#999';
-            message.style.fontStyle = 'italic';
-            container.appendChild(message);
-        }
-    }
-}
-
-function updateSummaryCards(data) {
-  const revenue = data.waterfall.revenue;
-  const expenses = data.waterfall.expenses;
-  const netIncome = data.waterfall.net_cash;
-  const profitMargin = revenue > 0 ? ((netIncome / revenue) * 100).toFixed(2) : 0;
-  
-  document.getElementById('totalRevenue').textContent = formatCurrency(revenue);
-  document.getElementById('totalExpenses').textContent = formatCurrency(expenses);
-  document.getElementById('netIncome').textContent = formatCurrency(netIncome);
-  document.getElementById('profitMargin').textContent = `${profitMargin}%`;
-  updateStatisticalSummary(data);
-}
-
-document.getElementById('registerForm').addEventListener('submit', function(e) {
-    e.preventDefault();
-    const formData = {
-        username: document.getElementById('regUsername').value,
-        email: document.getElementById('regEmail').value,
-        password: document.getElementById('regPassword').value
-    };
-    
-    fetch('/register', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(formData)
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.message) {
-            alert(data.message);
-            window.location.href = '/login';
-        }
-    })
-    .catch(error => console.error('Error:', error));
-});
-
-
-
-function updateCharts() {
-    if (typeof ChartDataLabels !== 'undefined') {
-        Chart.register(ChartDataLabels);
-    }
-    
-    // Waterfall Chart
-    if (waterfallChart) waterfallChart.destroy();
-    const waterfallCtx = document.getElementById('waterfallChart').getContext('2d');
-    waterfallChart = new Chart(waterfallCtx, {
-        type: 'bar',
-        data: {
-            labels: ['Revenue', 'Expenses', 'Net Cash'],
-            datasets: [{
-                label: 'Amount ($)',
-                data: [
-                    visualizations.waterfall.revenue,
-                    -visualizations.waterfall.expenses,
-                    visualizations.waterfall.net_cash,
-                ],
-                backgroundColor: [
-                    'rgba(75, 192, 192, 0.6)',
-                    'rgba(255, 99, 132, 0.6)',
-                    'rgba(54, 162, 235, 0.6)',
-                ],
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            aspectRatio: 2,
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            let label = context.dataset.label || '';
-                            if (label) label += ': ';
-                            label += '$' + Math.abs(context.raw).toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                            return label;
-                        }
-                    }
-                },
-                datalabels: {
-                    color: '#000',
-                    anchor: 'end',
-                    align: 'top',
-                    formatter: function(value) {
-                        return '$' + Math.abs(value).toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                    },
-                    font: {
-                        weight: 'bold',
-                        size: 10
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + Math.abs(value).toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        },
-        plugins: [ChartDataLabels]
-    });
-
-    // Pie Charts (Revenue and Expense) - Common options
-    const pieOptions = {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-            tooltip: {
-                callbacks: {
-                    label: function(context) {
-                        const label = context.label || '';
-                        const value = '$' + context.raw.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                        const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                        const percentage = Math.round((context.parsed / total) * 100) + '%';
-                        return `${label}: ${value} (${percentage})`;
-                    }
-                }
-            },
-            datalabels: {
-                color: '#fff',
-                font: {
-                    weight: 'bold',
-                    size: 12
-                },
-                formatter: function(value, context) {
-                    const dataset = context.chart.data.datasets[0];
-                    const total = dataset.data.reduce((acc, data) => acc + data, 0);
-                    const percentage = Math.round((value / total) * 100) + '%';
-                    return percentage;
-                }
-            }
-        }
-    };
-
-    // Revenue Chart
-    if (revenueChart) revenueChart.destroy();
-    const revenueCtx = document.getElementById('revenueChart').getContext('2d');
-    
-    const revenueBreakdown = visualizations.revenue_breakdown || {};
-    
-    revenueChart = new Chart(revenueCtx, {
-        type: 'pie',
-        data: {
-            labels: Object.keys(revenueBreakdown),
-            datasets: [{
-                data: Object.values(revenueBreakdown),
-                backgroundColor: [
-                    'rgba(255, 99, 132, 0.8)',
-                    'rgba(54, 162, 235, 0.8)',
-                    'rgba(255, 206, 86, 0.8)',
-                    'rgba(75, 192, 192, 0.8)',
-                    'rgba(153, 102, 255, 0.8)',
-                    'rgba(255, 159, 64, 0.8)',
-                    'rgba(199, 199, 199, 0.8)',
-                ],
-                borderColor: [
-                    'rgba(255, 99, 132, 1)',
-                    'rgba(54, 162, 235, 1)',
-                    'rgba(255, 206, 86, 1)',
-                    'rgba(75, 192, 192, 1)',
-                    'rgba(153, 102, 255, 1)',
-                    'rgba(255, 159, 64, 1)',
-                    'rgba(199, 199, 199, 1)',
-                ],
-                borderWidth: 1
-            }]
-        },
-        options: pieOptions,
-        plugins: [ChartDataLabels]
-    });
-
-    // Expense Chart
-    if (expenseChart) expenseChart.destroy();
-    const expenseCtx = document.getElementById('expenseChart').getContext('2d');
-    
-    const expenseBreakdown = visualizations.expense_breakdown || {};
-    
-    expenseChart = new Chart(expenseCtx, {
-        type: 'pie',
-        data: {
-            labels: Object.keys(expenseBreakdown),
-            datasets: [{
-                data: Object.values(expenseBreakdown),
-                backgroundColor: [
-                    'rgba(255, 99, 132, 0.8)',
-                    'rgba(54, 162, 235, 0.8)',
-                    'rgba(255, 206, 86, 0.8)',
-                    'rgba(75, 192, 192, 0.8)',
-                    'rgba(153, 102, 255, 0.8)',
-                    'rgba(255, 159, 64, 0.8)',
-                    'rgba(199, 199, 199, 0.8)',
-                ],
-                borderColor: [
-                    'rgba(255, 99, 132, 1)',
-                    'rgba(54, 162, 235, 1)',
-                    'rgba(255, 206, 86, 1)',
-                    'rgba(75, 192, 192, 1)',
-                    'rgba(153, 102, 255, 1)',
-                    'rgba(255, 159, 64, 1)',
-                    'rgba(199, 199, 199, 1)',
-                ],
-                borderWidth: 1
-            }]
-        },
-        options: pieOptions,
-        plugins: [ChartDataLabels]
-    });
-
-    // Trends Chart
-    if (trendsChart) trendsChart.destroy();
-    const trendsCtx = document.getElementById('trendsChart').getContext('2d');
-    
-    const monthlyTrends = visualizations.monthly_trends || { revenue: {}, expense: {} };
-    
-    trendsChart = new Chart(trendsCtx, {
-        type: 'line',
-        data: {
-            labels: Object.keys(monthlyTrends.revenue),
-            datasets: [
-                {
-                    label: 'Revenue ($)',
-                    data: Object.values(monthlyTrends.revenue),
-                    borderColor: 'rgba(75, 192, 192, 1)',
-                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                    fill: true,
-                    tension: 0.3,
-                },
-                {
-                    label: 'Expenses ($)',
-                    data: Object.values(monthlyTrends.expense),
-                    borderColor: 'rgba(255, 99, 132, 1)',
-                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                    fill: true,
-                    tension: 0.3,
-                }
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.dataset.label + ': $' + context.raw.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                },
-                datalabels: {
-                    color: '#000',
-                    anchor: 'end',
-                    align: 'top',
-                    formatter: function(value) {
-                        return '$' + value.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                    },
-                    font: {
-                        weight: 'bold',
-                        size: 10
-                    },
-                    display: function(context) {
-                        // Only show labels for every other data point to avoid clutter
-                        return context.dataIndex % 2 === 0;
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + value.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        },
-        plugins: [ChartDataLabels]
-    });
-}
-
-// 1. Detailed Revenue Breakdown Chart
-function createDetailedRevenueChart(data) {
-    if (detailedRevenueChart) detailedRevenueChart.destroy();
-    
-    const ctx = document.getElementById('detailedRevenueChart');
-    if (!ctx) return;
-    
-    // CORRECTED: Use revenue_breakdown instead of revenueData
-    const revenueBreakdown = data.revenue_breakdown || {};
-    
-    // Check if we have data
-    if (Object.keys(revenueBreakdown).length === 0 || Object.values(revenueBreakdown).reduce((sum, val) => sum + val, 0) === 0) {
-        showNoDataMessage('detailedRevenueChart');
-        return;
-    }
-    
-    const chartCtx = ctx.getContext('2d');
-    detailedRevenueChart = new Chart(chartCtx, {
-        type: 'bar',
-        data: {
-            labels: Object.keys(revenueBreakdown),
-            datasets: [{
-                label: 'Revenue ($)',
-                data: Object.values(revenueBreakdown),
-                backgroundColor: 'rgba(54, 162, 235, 0.7)',
-                borderColor: 'rgba(54, 162, 235, 1)',
-                borderWidth: 1
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return '$' + context.raw.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                },
-                datalabels: {
-                    color: '#000',
-                    anchor: 'end',
-                    align: 'top',
-                    formatter: function(value) {
-                        return '$' + value.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                    },
-                    font: {
-                        weight: 'bold',
-                        size: 10
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + value.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        },
-        plugins: [ChartDataLabels]
-    });
-}
-
-function createCompanyFranchiseChart(data) {
-    if (companyFranchiseChart) companyFranchiseChart.destroy();
-    
-    const ctx = document.getElementById('companyFranchiseChart');
-    if (!ctx) return;
-    
-    // Use data from backend
-    const companyFranchiseData = data.company_vs_franchise || {};
-    
-    // Check if we have data
-    if (Object.values(companyFranchiseData).reduce((sum, val) => sum + val, 0) === 0) {
-        showNoDataMessage('companyFranchiseChart');
-        return;
-    }
-    
-    const chartCtx = ctx.getContext('2d');
-    companyFranchiseChart = new Chart(chartCtx, {
-        type: 'bar',
-        data: {
-            labels: Object.keys(companyFranchiseData),
-            datasets: [{
-                label: 'Revenue ($)',
-                data: Object.values(companyFranchiseData),
-                backgroundColor: [
-                    'rgba(54, 162, 235, 0.7)',
-                    'rgba(255, 99, 132, 0.7)'
-                ],
-                borderColor: [
-                    'rgba(54, 162, 235, 1)',
-                    'rgba(255, 99, 132, 1)'
-                ],
-                borderWidth: 1
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return '$' + context.raw.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                },
-                datalabels: {
-                    color: '#000',
-                    anchor: 'end',
-                    align: 'top',
-                    formatter: function(value) {
-                        return '$' + value.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                    },
-                    font: {
-                        weight: 'bold',
-                        size: 10
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + value.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        },
-        plugins: [ChartDataLabels]
-    });
-}
-
-function createProfitabilityChart(data) {
-    if (profitabilityChart) profitabilityChart.destroy();
-    
-    const ctx = document.getElementById('profitabilityChart');
-    if (!ctx) return;
-    
-    // Calculate profitability metrics from your actual data
-    const revenue = data.waterfall.revenue || 0;
-    const expenses = data.waterfall.expenses || 0;
-    const netIncome = data.waterfall.net_cash || 0;
-    
-    // Check if we have data
-    if (revenue === 0 && expenses === 0 && netIncome === 0) {
-        showNoDataMessage('profitabilityChart');
-        return;
-    }
-    
-    // Calculate operating income (simplified as revenue - operating expenses)
-    const operatingIncome = revenue - expenses;
-    
-    // Calculate profit margin
-    const profitMargin = revenue > 0 ? (netIncome / revenue) * 100 : 0;
-    
-    const profitabilityData = {
-        'Operating Income': operatingIncome,
-        'Net Income': netIncome,
-        'Profit Margin (%)': parseFloat(profitMargin.toFixed(2))
-    };
-    
-    const chartCtx = ctx.getContext('2d');
-    profitabilityChart = new Chart(chartCtx, {
-        type: 'bar',
-        data: {
-            labels: Object.keys(profitabilityData),
-            datasets: [{
-                label: 'Amount ($)',
-                data: Object.values(profitabilityData),
-                backgroundColor: [
-                    'rgba(75, 192, 192, 0.7)',
-                    'rgba(54, 162, 235, 0.7)',
-                    'rgba(255, 159, 64, 0.7)'
-                ],
-                borderColor: [
-                    'rgba(75, 192, 192, 1)',
-                    'rgba(54, 162, 235, 1)',
-                    'rgba(255, 159, 64, 1)'
-                ],
-                borderWidth: 1
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            if (context.label === 'Profit Margin (%)') {
-                                return `${context.label}: ${context.raw}%`;
-                            }
-                            return '$' + context.raw.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                },
-                datalabels: {
-                    color: '#000',
-                    anchor: 'end',
-                    align: 'top',
-                    formatter: function(value, context) {
-                        if (context.chart.data.labels[context.dataIndex] === 'Profit Margin (%)') {
-                            return value + '%';
-                        }
-                        return '$' + value.toLocaleString('en-US', {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2
-                        });
-                    },
-                    font: {
-                        weight: 'bold',
-                        size: 10
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + value.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        },
-        plugins: [ChartDataLabels]
-    });
-}
-
-// 4. EPS & Dividend Trends Chart
-function createEPSDividendChart(data) {
-    if (epsDividendChart) epsDividendChart.destroy();
-    
-    const ctx = document.getElementById('epsDividendChart');
-    if (!ctx) return;
-    
-    // Check if we have monthly data
-    const monthlyTrends = data.monthly_trends || {};
-    const hasMonthlyData = Object.keys(monthlyTrends.revenue || {}).length > 0;
-    
-    if (!hasMonthlyData) {
-        showNoDataMessage('epsDividendChart');
-        return;
-    }
-    
-    const chartCtx = ctx.getContext('2d');
-    
-    // Use data from backend if available, otherwise calculate
-    const epsDividendData = data.eps_dividend || {};
-    
-    const months = Object.keys(monthlyTrends.revenue || {});
-    let epsValues = [];
-    let dividendValues = [];
-    
-    // Calculate EPS and dividends from monthly data
-    months.forEach(month => {
-        const revenue = monthlyTrends.revenue[month] || 0;
-        const expense = monthlyTrends.expense[month] || 0;
-        const netIncome = revenue - expense;
-        
-        // Simplified calculations - adjust these formulas as needed
-        epsValues.push(netIncome > 0 ? (netIncome / 1000) : 0); // EPS calculation
-        dividendValues.push(netIncome > 0 ? (netIncome * 0.2) : 0); // 20% dividend payout
-    });
-    
-    epsDividendChart = new Chart(chartCtx, {
-        type: 'line',
-        data: {
-            labels: months,
-            datasets: [
-                {
-                    label: 'EPS ($)',
-                    data: epsValues,
-                    borderColor: 'rgba(54, 162, 235, 1)',
-                    backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                    fill: false,
-                    tension: 0.3,
-                },
-                {
-                    label: 'Dividends ($)',
-                    data: dividendValues,
-                    borderColor: 'rgba(255, 99, 132, 1)',
-                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                    fill: false,
-                    tension: 0.3,
-                }
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return `${context.dataset.label}: $${context.raw.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            })}`;
-                        }
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: function(value) {
-                            return '$' + value.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-function updateAnomaliesTable() {
-    const tableContainer = document.getElementById('anomaliesTable');
-    tableContainer.innerHTML = ''; // Clear previous anomalies
-    
-    if (!anomalies || anomalies.length === 0) {
-        tableContainer.innerHTML = '<p>No anomalies detected</p>';
-        return;
-    }
-    
-    const table = document.createElement('table');
-    table.className = 'anomalies-table';
-    
-    // Create header
-    const thead = document.createElement('thead');
-    thead.innerHTML = `
-        <tr>
-            <th>Date</th>
-            <th>Category</th>
-            <th>Type</th>
-            <th>Amount ($)</th>
-            <th>Reason</th>
-        </tr>
-    `;
-    table.appendChild(thead);
-    
-    // Create body
-    const tbody = document.createElement('tbody');
-    anomalies.forEach(anomaly => {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td>${new Date(anomaly.date).toLocaleDateString()}</td>
-            <td>${anomaly.category}</td>
-            <td>${anomaly.type}</td>
-            <td>$${parseFloat(anomaly.amount).toLocaleString('en-NG', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
-            <td>${anomaly.reason}</td>
-        `;
-        tbody.appendChild(row);
-    });
-    table.appendChild(tbody);
-    tableContainer.appendChild(table);
-}
-
-// Function to update statistical summary cards
-function updateStatisticalSummary(data) {
-  const stats = data.statistical_summary || {};
-  
-  // Use backend data, otherwise calculate locally
-  const avgMonthlyRevenue = stats.avg_monthly_revenue || 
-    (Object.values(data.monthly_trends?.revenue || {}).reduce((sum, val) => sum + val, 0) / 
-    Object.keys(data.monthly_trends?.revenue || {}).length || 0);
-  
-  const revenueGrowthRate = stats.revenue_growth_rate || 0;
-  const expenseToRevenue = stats.expense_to_revenue_ratio || 
-    ((data.waterfall.expenses / data.waterfall.revenue) * 100) || 0;
-  
-  const anomalyPercentage = stats.anomaly_percentage || 
-    ((data.anomalies.length / (data.anomalies.length + 100)) * 100) || 0;
-  
-  // Update the DOM elements
-  document.getElementById('avgMonthlyRevenue').textContent = formatCurrency(avgMonthlyRevenue);
-  document.getElementById('revenueGrowthRate').textContent = `${revenueGrowthRate.toFixed(2)}%`;
-  document.getElementById('expenseToRevenue').textContent = `${expenseToRevenue.toFixed(2)}%`;
-  document.getElementById('anomalyPercentage').textContent = `${anomalyPercentage.toFixed(2)}%`;
-}
-
-async function handleFileUpload(e) {
-  e.preventDefault();
-  const fileInput = document.getElementById('fileInput');
-  const file = fileInput.files[0];
-  
-  if (!file) {
-    alert('Please select a file');
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append('file', file);
-  
-  try {
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      credentials: 'include',  // Important for cookies
-      body: formData,
-    });
-    
-    const data = await response.json();
-    if (response.ok) {
-      alert(data.message);
-      // Refresh visualizations with the restaurant_id from response
-      await fetchVisualizations(data.restaurant_id);
-    } else {
-      alert(data.message);
-    }
-  } catch (error) {
-    console.error('Upload error:', error);
-    alert('Failed to upload file');
-  }
-}
-
-// function to handle missing elements
-function ensureAllElementsExist() {
-  // Create missing chart containers 
-  const chartIds = [
-    'waterfallChart', 'revenueChart', 'expenseChart', 'trendsChart',
-    'detailedRevenueChart', 'companyFranchiseChart', 'profitabilityChart', 
-      'epsDividendChart'
-  ];
-  
-  chartIds.forEach(chartId => {
-    if (!document.getElementById(chartId)) {
-      console.warn(`Chart element ${chartId} not found, creating placeholder`);
-    }
-  });
-  
-  // Ensure summary cards exist
-  const summaryIds = [
-    'totalRevenue', 'totalExpenses', 'netIncome', 'profitMargin',
-    'avgMonthlyRevenue', 'revenueGrowthRate', 'expenseToRevenue', 'anomalyPercentage'
-  ];
-  
-  summaryIds.forEach(summaryId => {
-    if (!document.getElementById(summaryId)) {
-      console.warn(`Summary element ${summaryId} not found`);
-    }
-  });
-}
-
-async function generateServerReport() {
-    ensureAllElementsExist();
-    const loadingElement = document.getElementById('reportLoading');
-    if (loadingElement) {
-        loadingElement.style.display = 'flex';
-    }
-
-    try {
-        // First get the user's restaurant
-        const restaurantRes = await fetch('/api/restaurants', {
-            credentials: 'include'
-        });
-        
-        if (!restaurantRes.ok) {
-            throw new Error('Failed to get restaurant data');
-        }
-        
-        const restaurants = await restaurantRes.json();
-        if (restaurants.length === 0) {
-            throw new Error('No restaurant found');
-        }
-        
-        // Use the first restaurant
-        const restaurantId = restaurants[0].id;
-        
-        // Get current visualizations data
-        if (!visualizations) {
-            await fetchVisualizations(restaurantId);
-        }
-        
-        // Capture all chart images (REMOVED cashFlowAnalysisChart)
-        const chartImages = {};
-        const chartIds = [
-            'waterfallChart', 'revenueChart', 'expenseChart', 'trendsChart',
-            'detailedRevenueChart', 'companyFranchiseChart', 'profitabilityChart', 
-            'epsDividendChart'  // Removed: 'cashFlowAnalysisChart'
-        ];
-        
-        for (const chartId of chartIds) {
-            const canvas = document.getElementById(chartId);
-            if (canvas) {
-                // Use html2canvas for better rendering
-                const chartContainer = canvas.closest('.chart-container');
-                if (chartContainer) {
-                    try {
-                        const chartImage = await html2canvas(chartContainer, {
-                            backgroundColor: '#FFFFFF',
-                            scale: 2 // Higher resolution for PDF
-                        });
-                        chartImages[chartId] = chartImage.toDataURL('image/png');
-                    } catch (error) {
-                        console.error(`Error capturing ${chartId}:`, error);
-                        // Fallback to just the canvas
-                        chartImages[chartId] = canvas.toDataURL('image/png');
-                    }
-                } else {
-                    chartImages[chartId] = canvas.toDataURL('image/png');
-                }
-            }
-        }    
-    // Capture summary cards
-    const summaryCards = document.querySelector('.summary-cards');
-    let summaryCardsImage = '';
-    if (summaryCards) {
-      try {
-        const summaryCanvas = await html2canvas(summaryCards, {
-          backgroundColor: '#FFFFFF',
-          scale: 2
-        });
-        summaryCardsImage = summaryCanvas.toDataURL('image/png');
-      } catch (error) {
-        console.error('Error capturing summary cards:', error);
-      }
-    }
-    
-    // Capture statistical summary cards
-    const statisticalSummary = document.querySelector('.statistical-summary');
-    let statisticalSummaryImage = '';
-    if (statisticalSummary) {
-      try {
-        const statisticalCanvas = await html2canvas(statisticalSummary, {
-          backgroundColor: '#FFFFFF',
-          scale: 2
-        });
-        statisticalSummaryImage = statisticalCanvas.toDataURL('image/png');
-      } catch (error) {
-        console.error('Error capturing statistical summary:', error);
-      }
-    }
-    
-    // Capture anomalies table
-    const anomaliesTable = document.getElementById('anomaliesTable');
-    let anomaliesTableHTML = '';
-    if (anomaliesTable) {
-      anomaliesTableHTML = anomaliesTable.innerHTML;
-    }
-    
-    // Capture summary cards values as text
-    const summaryData = {
-      totalRevenue: document.getElementById('totalRevenue')?.textContent || '$0.00',
-      totalExpenses: document.getElementById('totalExpenses')?.textContent || '$0.00',
-      netIncome: document.getElementById('netIncome')?.textContent || '$0.00',
-      profitMargin: document.getElementById('profitMargin')?.textContent || '0%',
-      avgMonthlyRevenue: document.getElementById('avgMonthlyRevenue')?.textContent || '$0.00',
-      revenueGrowthRate: document.getElementById('revenueGrowthRate')?.textContent || '0%',
-      expenseToRevenue: document.getElementById('expenseToRevenue')?.textContent || '0%',
-      anomalyPercentage: document.getElementById('anomalyPercentage')?.textContent || '0%'
-    };
-    
-    // Generate comprehensive report
-    const response = await fetch('/api/generate_report', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      credentials: 'include',
-      body: JSON.stringify({
-        restaurant_id: restaurantId,
-        report_type: 'comprehensive',
-        visualizations: visualizations,
-        anomalies: anomalies,
-        currency: currency,
-        chart_images: chartImages,
-        summary_cards_image: summaryCardsImage,
-        statistical_summary_image: statisticalSummaryImage,
-        anomalies_table: anomaliesTableHTML,
-        summary_data: summaryData
-      })
-    });
-    
-    if (response.ok) {
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `comprehensive_report_${new Date().toISOString().split('T')[0]}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } else {
-      const errorData = await response.json();
-      throw new Error(errorData.message || 'Failed to generate report');
-    }
-  } catch (error) {
-    console.error('Error generating report:', error);
-    alert(error.message || 'Failed to generate report');
-  }finally {
-    if (loadingElement) {
-      loadingElement.style.display = 'none';
-    }
-  }
+function getCookie(name) {
+  const cookie = document.cookie
+    .split("; ")
+    .find((item) => item.startsWith(`${name}=`));
+  return cookie ? decodeURIComponent(cookie.slice(name.length + 1)) : "";
 }

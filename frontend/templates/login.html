@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in | Restaurant Cash Flow Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <script src="{{ url_for('static', filename='js/script.js') }}" defer></script>
+</head>
+<body class="auth-page">
+  <main class="auth-form">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">RC</span><span>Restaurant <strong>Cash Flow</strong></span></a>
+    <h1>Welcome back</h1>
+    <p>Sign in to see how your restaurant is performing.</p>
+    <form id="loginForm">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+      <button class="button button-primary" type="submit">Sign in</button>
+      <p class="auth-error" id="errorMessage" role="alert" hidden></p>
+      <p class="auth-switch">New here? <a href="/register">Create an account</a></p>
+    </form>
+  </main>
+</body>
+</html>

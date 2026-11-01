@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Restaurant cash flow, performance and anomaly analysis in Nigerian naira.">
+  <title>Analysis dashboard | Restaurant Cash Flow Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <script src="{{ url_for('static', filename='js/script.js') }}" defer></script>
+</head>
+<body class="dashboard-page">
+  <div class="app-shell" id="dashboardContent">
+    <header class="app-header">
+      <a class="brand brand-dark" href="/" aria-label="Restaurant Cash Flow Analyzer home">
+        <span class="brand-mark" aria-hidden="true">RC</span>
+        <span>Restaurant <strong>Cash Flow</strong></span>
+      </a>
+      <div class="header-actions">
+        <span class="header-note">Nigerian restaurant insights</span>
+        <button class="button button-quiet" id="logoutButton" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="dashboard-intro">
+        <div>
+          <p class="eyebrow">YOUR BUSINESS, AT A GLANCE</p>
+          <h1>Cash-flow dashboard</h1>
+          <p class="muted">See what is coming in, what is going out, and which transactions need a closer look.</p>
+        </div>
+        <div class="dashboard-actions">
+          <button class="button button-outline" id="exportTransactions" type="button">
+            Back up transactions CSV
+          </button>
+          <button class="button button-primary" id="downloadReport" type="button">
+            Download analysis PDF
+          </button>
+        </div>
+      </section>
+
+      <section class="workspace-panel" aria-label="Restaurant and transaction data">
+        <div class="restaurant-control">
+          <label for="restaurantSelect">Restaurant</label>
+          <select id="restaurantSelect" aria-label="Select restaurant"></select>
+        </div>
+        <form id="restaurantForm" class="restaurant-form">
+          <label class="sr-only" for="restaurantName">New restaurant name</label>
+          <input id="restaurantName" name="name" maxlength="120" placeholder="Add another restaurant" required>
+          <button class="button button-outline" type="submit">Add restaurant</button>
+        </form>
+        <form id="uploadForm" class="upload-form">
+          <label class="file-label" for="fileInput">
+            <span class="file-label-title">Import transactions</span>
+            <span class="file-label-help">CSV or Excel (.xlsx), up to 10 MB</span>
+          </label>
+          <input type="file" id="fileInput" name="file" accept=".csv,.xlsx" required>
+          <button class="button button-primary" type="submit" id="uploadButton">Analyze data</button>
+          <a class="template-link" href="{{ url_for('static', filename='transaction-template.csv') }}" download>Download CSV template</a>
+        </form>
+        <p class="data-guidance">
+          Required columns: <code>date</code>, <code>amount</code>, <code>category</code>, <code>type</code>.
+          Currency defaults to NGN. For other currencies, include <code>currency</code> and
+          <code>exchange_rate_to_ngn</code> (naira per unit of that currency). Imports append to your data.
+        </p>
+        <p id="dashboardMessage" class="status-message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="metric-grid" aria-label="Financial summary">
+        <article class="metric-card metric-revenue">
+          <p class="metric-label">Total revenue</p>
+          <p class="metric-value" id="totalRevenue">₦0.00</p>
+          <p class="metric-footnote">All recorded income, shown in NGN</p>
+        </article>
+        <article class="metric-card metric-expenses">
+          <p class="metric-label">Total expenses</p>
+          <p class="metric-value" id="totalExpenses">₦0.00</p>
+          <p class="metric-footnote">All recorded operating costs, shown in NGN</p>
+        </article>
+        <article class="metric-card metric-net">
+          <p class="metric-label">Net cash flow</p>
+          <p class="metric-value" id="netIncome">₦0.00</p>
+          <p class="metric-footnote">Revenue less expenses</p>
+        </article>
+        <article class="metric-card metric-margin">
+          <p class="metric-label">Profit margin</p>
+          <p class="metric-value" id="profitMargin">0.00%</p>
+          <p class="metric-footnote">Net cash flow as a share of revenue</p>
+        </article>
+      </section>
+
+      <section class="analysis-grid" aria-label="Restaurant analysis charts">
+        <article class="chart-card chart-card-wide">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">PERFORMANCE OVER TIME</p>
+              <h2>Monthly cash flow</h2>
+            </div>
+            <span class="chart-unit">NGN</span>
+          </div>
+          <div class="chart-frame"><canvas id="cashFlowChart" aria-label="Monthly revenue and expenses chart"></canvas></div>
+        </article>
+        <article class="chart-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">WHERE IT COMES FROM</p>
+              <h2>Revenue by source</h2>
+            </div>
+          </div>
+          <div class="chart-frame"><canvas id="revenueChart" aria-label="Revenue sources chart"></canvas></div>
+        </article>
+        <article class="chart-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">WHAT IT COSTS</p>
+              <h2>Expenses by category</h2>
+            </div>
+          </div>
+          <div class="chart-frame"><canvas id="expenseChart" aria-label="Expense categories chart"></canvas></div>
+        </article>
+      </section>
+
+      <section class="insights-grid" aria-label="Additional business indicators">
+        <article class="insight-card">
+          <p class="metric-label">Average monthly revenue</p>
+          <p class="insight-value" id="avgMonthlyRevenue">₦0.00</p>
+          <p class="metric-footnote">Across months with transaction data</p>
+        </article>
+        <article class="insight-card">
+          <p class="metric-label">Latest-month revenue change</p>
+          <p class="insight-value" id="revenueGrowthRate">Not available</p>
+          <p class="metric-footnote">Compared with the previous recorded month</p>
+        </article>
+        <article class="insight-card">
+          <p class="metric-label">Expenses as a share of revenue</p>
+          <p class="insight-value" id="expenseToRevenue">0.00%</p>
+          <p class="metric-footnote">Helps track operating-cost pressure</p>
+        </article>
+        <article class="insight-card insight-alert">
+          <p class="metric-label">Unusual transactions</p>
+          <p class="insight-value" id="anomalyPercentage">0</p>
+          <p class="metric-footnote" id="anomalyFootnote">No transactions analyzed yet</p>
+        </article>
+      </section>
+
+      <section class="anomaly-card">
+        <div class="section-heading anomaly-heading">
+          <div>
+            <p class="eyebrow">REVIEW BEFORE YOU CLOSE THE BOOKS</p>
+            <h2>Transactions to check</h2>
+          </div>
+          <span class="anomaly-count" id="anomalyCount">0 flagged</span>
+        </div>
+        <p class="anomaly-explainer">Amounts that stand out from transactions with the same category, type and currency are flagged for review. A flag is a prompt to investigate, not proof of an error.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Date</th><th>Category</th><th>Type</th><th>Recorded amount</th><th>NGN equivalent</th><th>Why it was flagged</th></tr>
+            </thead>
+            <tbody id="anomaliesTable">
+              <tr><td class="empty-state" colspan="6">Import transactions to see analysis.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <footer class="dashboard-footer">Amounts are normalized to NGN using the exchange rates supplied with your transaction data.</footer>
+  </div>
+</body>
+</html>

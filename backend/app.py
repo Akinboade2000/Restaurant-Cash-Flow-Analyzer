@@ -1,743 +1,903 @@
-from flask import Flask, request, jsonify, send_file, render_template
-from flask_cors import CORS
-from model import db, User, Restaurant, Transaction, Report
-from datetime import datetime, timedelta
-import pandas as pd
-from io import BytesIO
-import numpy as np
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-import matplotlib.pyplot as plt
-import seaborn as sns
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import Image
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
-from reportlab.lib.styles import getSampleStyleSheet
-import base64
-import json
-import requests
+import csv
+import io
+import math
+import os
+import secrets
+import threading
+import zipfile
+from collections import defaultdict
+from datetime import date, datetime, timezone
+from html import escape
+from pathlib import Path
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request, send_file
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    get_jwt_identity,
+    jwt_required,
+    set_access_cookies,
+    unset_jwt_cookies,
+)
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
+from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.graphics.shapes import Drawing
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+from model import Restaurant, Transaction, User, db
 
 
-app = Flask(__name__, template_folder='../frontend/templates', static_folder='../frontend/static')
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///restaurant_cashflow.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'your-secret-key'  # Change in production
-app.config['JWT_TOKEN_LOCATION'] = ['cookies']
-app.config['JWT_COOKIE_SECURE'] = False  # True in production
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Enable CSRF protection in production
-jwt = JWTManager(app)
+load_dotenv()
+
+
+def create_database_settings(environment):
+    database_url = environment.get("TURSO_DATABASE_URL")
+    auth_token = environment.get("TURSO_AUTH_TOKEN")
+
+    if bool(database_url) != bool(auth_token):
+        raise RuntimeError(
+            "Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to use the hosted database."
+        )
+    if environment.get("VERCEL") and not database_url:
+        raise RuntimeError(
+            "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required in Vercel project settings."
+        )
+
+    if database_url:
+        if database_url.startswith("libsql://"):
+            host = database_url.removeprefix("libsql://").rstrip("/")
+        elif database_url.startswith("https://"):
+            host = database_url.removeprefix("https://").rstrip("/")
+        else:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL must start with libsql:// or https://."
+            )
+        return (
+            f"sqlite+libsql://{host}?secure=true",
+            {
+                "connect_args": {"auth_token": auth_token},
+                "pool_pre_ping": True,
+                "pool_recycle": 300,
+            },
+        )
+
+    database_path = Path(
+        environment.get(
+            "DATABASE_PATH",
+            str(Path(__file__).resolve().parent / "instance" / "restaurant_cashflow.db"),
+        )
+    ).expanduser().resolve()
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    return (
+        f"sqlite:///{database_path.as_posix()}",
+        {"connect_args": {"check_same_thread": False, "timeout": 30}},
+    )
+
+
+if os.getenv("VERCEL") and not os.getenv("JWT_SECRET_KEY"):
+    raise RuntimeError("JWT_SECRET_KEY must be configured in Vercel project settings.")
+
+app = Flask(
+    __name__,
+    template_folder="../frontend/templates",
+    static_folder="../frontend/static",
+)
+database_uri, engine_options = create_database_settings(os.environ)
+app.config.update(
+    SQLALCHEMY_DATABASE_URI=database_uri,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SQLALCHEMY_ENGINE_OPTIONS=engine_options,
+    JWT_SECRET_KEY=os.getenv("JWT_SECRET_KEY") or secrets.token_urlsafe(32),
+    JWT_TOKEN_LOCATION=["cookies"],
+    JWT_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "true" if os.getenv("VERCEL") else "false").lower()
+    == "true",
+    JWT_COOKIE_SAMESITE="Lax",
+    JWT_COOKIE_CSRF_PROTECT=True,
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,
+)
 db.init_app(app)
+jwt = JWTManager(app)
+_database_initialized = False
+_database_initialization_lock = threading.Lock()
 
-# Helper functions
-def detect_anomalies(transactions):
-    df = pd.DataFrame([{
-        'id': t.id,
-        'amount': t.amount,
-        'date': t.date,
-        'category': t.category,
-        'type': t.type,
-        'is_anomaly': t.is_anomaly  # Track if already marked as anomaly
-    } for t in transactions])
-    
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def ensure_database_schema():
+    global _database_initialized
+    if _database_initialized:
+        return
+    with _database_initialization_lock:
+        if _database_initialized:
+            return
+        db.create_all()
+        inspector = inspect(db.engine)
+        if "transaction" not in inspector.get_table_names():
+            _database_initialized = True
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("transaction")}
+        with db.engine.begin() as connection:
+            if "exchange_rate_to_ngn" not in columns:
+                connection.execute(
+                    text(
+                        'ALTER TABLE "transaction" ADD COLUMN '
+                        "exchange_rate_to_ngn FLOAT NOT NULL DEFAULT 1.0"
+                    )
+                )
+                tables = set(inspect(db.engine).get_table_names())
+                if "exchange_rate" in tables:
+                    connection.execute(
+                        text(
+                            'UPDATE "transaction" SET exchange_rate_to_ngn = COALESCE('
+                            "(SELECT rate FROM exchange_rate "
+                            'WHERE from_currency = "transaction".currency '
+                            "AND to_currency = 'NGN' ORDER BY last_updated DESC LIMIT 1), 1.0) "
+                            'WHERE currency != "NGN"'
+                        )
+                    )
+
+            if "amount_ngn" not in columns:
+                connection.execute(
+                    text(
+                        'ALTER TABLE "transaction" ADD COLUMN '
+                        "amount_ngn FLOAT NOT NULL DEFAULT 0.0"
+                    )
+                )
+                connection.execute(
+                    text(
+                        'UPDATE "transaction" SET amount_ngn = '
+                        "amount * exchange_rate_to_ngn WHERE amount_ngn = 0.0"
+                    )
+                )
+        _database_initialized = True
+
+
+@app.before_request
+def initialize_database():
+    ensure_database_schema()
+
+
+@app.errorhandler(SQLAlchemyError)
+def handle_database_error(error):
+    db.session.rollback()
+    app.logger.exception("SQLite request failed")
+    return jsonify({"message": "A database operation failed. Please try again."}), 500
+
+
+@app.errorhandler(413)
+def handle_upload_too_large(_error):
+    return jsonify({"message": "The upload exceeds the 10 MB limit."}), 413
+
+
+@jwt.unauthorized_loader
+def handle_unauthorized(_reason):
+    return jsonify({"message": "Please sign in to continue."}), 401
+
+
+def parse_date(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text_value = str(value or "").strip()
+    for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text_value, date_format)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError as error:
+        raise ValueError("use YYYY-MM-DD or DD/MM/YYYY") from error
+
+
+def parse_number(value, field_name):
+    try:
+        number = float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a number") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be a finite number")
+    return number
+
+
+def parse_transaction(row):
+    transaction_date = parse_date(row.get("date"))
+    amount = parse_number(row.get("amount"), "amount")
+    if amount < 0:
+        raise ValueError("amount cannot be negative")
+
+    category = str(row.get("category") or "").strip().lower()
+    category = {"income": "revenue", "sales": "revenue", "expenditure": "expense"}.get(
+        category, category
+    )
+    if category not in {"revenue", "expense"}:
+        raise ValueError("category must be revenue or expense")
+
+    transaction_type = str(row.get("type") or "").strip()
+    if not transaction_type:
+        raise ValueError("type is required")
+
+    currency = str(row.get("currency") or "NGN").strip().upper()
+    currency = {"₦": "NGN", "NAIRA": "NGN", "NAIRAS": "NGN"}.get(currency, currency)
+    if len(currency) != 3 or not currency.isalpha():
+        raise ValueError("currency must be a three-letter currency code such as NGN or USD")
+
+    if currency == "NGN":
+        exchange_rate = 1.0
+    else:
+        rate_value = row.get("exchange_rate_to_ngn") or row.get("rate_to_ngn")
+        if rate_value in (None, ""):
+            raise ValueError(f"exchange_rate_to_ngn is required for {currency} transactions")
+        exchange_rate = parse_number(rate_value, "exchange_rate_to_ngn")
+        if exchange_rate <= 0:
+            raise ValueError("exchange_rate_to_ngn must be greater than zero")
+
+    return {
+        "date": transaction_date,
+        "amount": amount,
+        "currency": currency,
+        "exchange_rate_to_ngn": exchange_rate,
+        "amount_ngn": round(amount * exchange_rate, 2),
+        "category": category,
+        "type": transaction_type,
+        "description": str(row.get("description") or "").strip()[:200],
+    }
+
+
+def read_uploaded_rows(upload):
+    extension = secure_filename(upload.filename or "").rsplit(".", 1)[-1].lower()
+    if extension == "csv":
+        try:
+            contents = upload.stream.read().decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise ValueError("The CSV must be saved as UTF-8.") from error
+        reader = csv.reader(io.StringIO(contents))
+        headers = [str(header or "").strip().lower() for header in next(reader, ())]
+        if not headers:
+            raise ValueError("The file must include a header row.")
+        rows = [dict(zip(headers, values)) for values in reader]
+    elif extension == "xlsx":
+        workbook = load_workbook(upload.stream, data_only=True, read_only=True)
+        try:
+            values = workbook.active.iter_rows(values_only=True)
+            headers = [str(value or "").strip().lower() for value in next(values, ())]
+            rows = [
+                dict(zip(headers, row))
+                for row in values
+                if any(value is not None and str(value).strip() for value in row)
+            ]
+        finally:
+            workbook.close()
+        if not headers:
+            raise ValueError("The file must include a header row.")
+    else:
+        raise ValueError("Upload a CSV or XLSX file.")
+
+    required = {"date", "amount", "category", "type"}
+    missing = sorted(required - set(headers))
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
+    return rows
+
+
+def percentile(sorted_values, fraction):
+    position = (len(sorted_values) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    return sorted_values[lower] * (upper - position) + sorted_values[upper] * (
+        position - lower
+    )
+
+
+def find_anomalies(transactions):
+    groups = defaultdict(list)
+    for transaction in transactions:
+        key = (
+            transaction.category,
+            transaction.type.strip().lower(),
+            transaction.currency,
+        )
+        groups[key].append(transaction)
+
     anomalies = []
-    for category in df['category'].unique():
-        for ttype in df[df['category'] == category]['type'].unique():
-            subset = df[(df['category'] == category) & (df['type'] == ttype) & (~df['is_anomaly'])]
-            
-            # Skip if not enough data points
-            if len(subset) < 3:
-                continue
-                
-            q1 = subset['amount'].quantile(0.25)
-            q3 = subset['amount'].quantile(0.75)
-            iqr = q3 - q1
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            
-            for _, row in subset.iterrows():
-                if row['amount'] < lower_bound or row['amount'] > upper_bound:
-                    anomalies.append({
-                        'id': row['id'],
-                        'amount': row['amount'],
-                        'date': row['date'],
-                        'category': category,
-                        'type': ttype,
-                        'reason': 'IQR outlier'
-                    })
-                    # Mark as anomaly in database
-                    transaction = Transaction.query.get(row['id'])
-                    if transaction:
-                        transaction.is_anomaly = True
-                        db.session.commit()
-    
-    return anomalies
+    for (category, transaction_type, currency), group in groups.items():
+        if len(group) < 4:
+            continue
+        values = sorted(transaction.amount for transaction in group)
+        q1 = percentile(values, 0.25)
+        q3 = percentile(values, 0.75)
+        iqr = q3 - q1
+        if iqr:
+            outliers = [
+                transaction
+                for transaction in group
+                if transaction.amount < q1 - 1.5 * iqr
+                or transaction.amount > q3 + 1.5 * iqr
+            ]
+        else:
+            median = percentile(values, 0.5)
+            deviations = sorted(abs(value - median) for value in values)
+            mad = percentile(deviations, 0.5)
+            if mad:
+                outliers = [
+                    transaction
+                    for transaction in group
+                    if abs(0.6745 * (transaction.amount - median) / mad) > 3.5
+                ]
+            else:
+                outliers = [
+                    transaction for transaction in group if transaction.amount != median
+                ]
 
-# Routes
-@app.route('/')
+        for transaction in outliers:
+            anomalies.append(
+                {
+                    "id": transaction.id,
+                    "date": transaction.date.isoformat(),
+                    "amount": transaction.amount,
+                    "currency": currency,
+                    "exchange_rate_to_ngn": transaction.exchange_rate_to_ngn,
+                    "amount_ngn": transaction.amount_ngn,
+                    "category": category,
+                    "type": transaction.type,
+                    "reason": (
+                        f"Unusual {category} amount for {transaction_type} transactions "
+                        f"recorded in {currency}."
+                    ),
+                }
+            )
+    return sorted(anomalies, key=lambda anomaly: anomaly["date"], reverse=True)
+
+
+def analyze_transactions(transactions):
+    anomalies = find_anomalies(transactions)
+    revenue = sum(t.amount_ngn for t in transactions if t.category == "revenue")
+    expenses = sum(t.amount_ngn for t in transactions if t.category == "expense")
+
+    month_totals = defaultdict(lambda: {"revenue": 0.0, "expense": 0.0})
+    revenue_breakdown = defaultdict(float)
+    expense_breakdown = defaultdict(float)
+    for transaction in transactions:
+        month = transaction.date.strftime("%Y-%m")
+        month_totals[month][transaction.category] += transaction.amount_ngn
+        breakdown = (
+            revenue_breakdown
+            if transaction.category == "revenue"
+            else expense_breakdown
+        )
+        breakdown[transaction.type] += transaction.amount_ngn
+
+    months = sorted(month_totals)
+    monthly_revenue = [round(month_totals[month]["revenue"], 2) for month in months]
+    monthly_expense = [round(month_totals[month]["expense"], 2) for month in months]
+    growth_rate = None
+    if len(monthly_revenue) > 1 and monthly_revenue[-2] > 0:
+        growth_rate = round(
+            (monthly_revenue[-1] - monthly_revenue[-2]) / monthly_revenue[-2] * 100,
+            2,
+        )
+
+    return {
+        "waterfall": {
+            "revenue": round(revenue, 2),
+            "expenses": round(expenses, 2),
+            "net_cash": round(revenue - expenses, 2),
+        },
+        "revenue_breakdown": {
+            key: round(value, 2) for key, value in sorted(revenue_breakdown.items())
+        },
+        "expense_breakdown": {
+            key: round(value, 2) for key, value in sorted(expense_breakdown.items())
+        },
+        "monthly_trends": {
+            "months": months,
+            "revenue": monthly_revenue,
+            "expense": monthly_expense,
+            "net_cash": [
+                round(month_totals[month]["revenue"] - month_totals[month]["expense"], 2)
+                for month in months
+            ],
+        },
+        "anomalies": anomalies,
+        "statistical_summary": {
+            "avg_monthly_revenue": round(revenue / len(months), 2) if months else 0,
+            "revenue_growth_rate": growth_rate,
+            "expense_to_revenue_ratio": round(expenses / revenue * 100, 2)
+            if revenue
+            else 0,
+            "anomaly_percentage": round(len(anomalies) / len(transactions) * 100, 2)
+            if transactions
+            else 0,
+            "transaction_count": len(transactions),
+            "anomaly_count": len(anomalies),
+            "active_months": len(months),
+        },
+    }
+
+
+def owned_restaurant(restaurant_id, user_id):
+    try:
+        restaurant_id = int(restaurant_id)
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    return Restaurant.query.filter_by(id=restaurant_id, user_id=user_id).first()
+
+
+def serialize_transaction(transaction):
+    return {
+        "id": transaction.id,
+        "date": transaction.date.isoformat(),
+        "amount": transaction.amount,
+        "currency": transaction.currency,
+        "exchange_rate_to_ngn": transaction.exchange_rate_to_ngn,
+        "amount_ngn": transaction.amount_ngn,
+        "category": transaction.category,
+        "type": transaction.type,
+        "description": transaction.description or "",
+        "is_anomaly": transaction.is_anomaly,
+    }
+
+
+@app.get("/")
 def home():
-    return render_template('index.html')
+    return render_template("index.html")
 
-@app.route('/login')
+
+@app.get("/login")
 def login_page():
-    return render_template('login.html')
+    return render_template("login.html")
 
-@app.route('/register')
+
+@app.get("/register")
 def register_page():
-    return render_template('register.html')
+    return render_template("register.html")
 
-@app.route('/dashboard')
+
+@app.get("/dashboard")
 @jwt_required()
-def dashboard():
-    current_user_id = get_jwt_identity()  
-    return render_template('dashboard.html')
+def dashboard_page():
+    return render_template("dashboard.html")
 
-@app.route('/api/verify-auth')
+
+@app.get("/api/verify-auth")
 @jwt_required()
 def verify_auth():
-    return jsonify({'message': 'Authenticated'}), 200
+    return jsonify({"message": "Authenticated"}), 200
 
-@app.route('/api/register', methods=['POST'])
+
+@app.post("/api/register")
 def register():
-    try:
-        data = request.get_json()
-        
-        # Validate required fields
-        if not all(k in data for k in ['username', 'email', 'password']):
-            return jsonify({'message': 'Missing required fields'}), 400
-            
-        # Check if user already exists
-        if User.query.filter_by(username=data['username']).first():
-            return jsonify({'message': 'Username already exists'}), 400
-        if User.query.filter_by(email=data['email']).first():
-            return jsonify({'message': 'Email already exists'}), 400
-            
-        # Create new user
-        hashed_password = generate_password_hash(data['password'])
-        new_user = User(
-            username=data['username'],
-            email=data['email'],
-            password=hashed_password
-        )
-        db.session.add(new_user)
-        db.session.commit()
-        
-        return jsonify({
-            'message': 'User created successfully',
-            'user': {
-                'id': new_user.id,
-                'username': new_user.username,
-                'email': new_user.email
-            }
-        }), 201
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'message': str(e)}), 500
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "A JSON request body is required."}), 400
+    username = str(data.get("username") or "").strip()
+    email = str(data.get("email") or "").strip().lower()
+    password = str(data.get("password") or "")
+    if not username or not email or not password:
+        return jsonify({"message": "Username, email, and password are required."}), 400
+    if len(password) < 8:
+        return jsonify({"message": "Password must contain at least 8 characters."}), 400
 
-@app.route('/api/login', methods=['POST'])
+    user = User(
+        username=username,
+        email=email,
+        password=generate_password_hash(password),
+    )
+    db.session.add(user)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "That username or email is already registered."}), 409
+    return jsonify(
+        {
+            "message": "Account created successfully.",
+            "user": {"id": user.id, "username": user.username, "email": user.email},
+        }
+    ), 201
+
+
+@app.post("/api/login")
 def login():
-    if not request.is_json:
-        return jsonify({"message": "Missing JSON in request"}), 400
-        
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-    
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "A JSON request body is required."}), 400
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
     if not username or not password:
-        return jsonify({"message": "Missing username or password"}), 400
+        return jsonify({"message": "Username and password are required."}), 400
 
     user = User.query.filter_by(username=username).first()
-    
-    if user and check_password_hash(user.password, password):
-        # Create token with string identity
-        access_token = create_access_token(identity=str(user.id))  # Convert to string
-        response = jsonify({
-            "message": "Login successful",
-            "user": {
-                "id": user.id,
-                "username": user.username
-            }
-        })
-        response.set_cookie(
-            'access_token_cookie',
-            access_token,
-            httponly=True,
-            secure=False,  # True in production with HTTPS
-            samesite='Lax'
-        )
-        return response, 200
-    
-    return jsonify({"message": "Invalid credentials"}), 401
+    if not user or not check_password_hash(user.password, password):
+        return jsonify({"message": "Invalid username or password."}), 401
 
-@app.route('/api/restaurants', methods=['GET', 'POST'])
+    response = jsonify(
+        {"message": "Login successful.", "user": {"id": user.id, "username": username}}
+    )
+    set_access_cookies(response, create_access_token(identity=str(user.id)))
+    return response, 200
+
+
+@app.post("/api/logout")
+def logout():
+    response = jsonify({"message": "Signed out."})
+    unset_jwt_cookies(response)
+    return response, 200
+
+
+@app.route("/api/restaurants", methods=["GET", "POST"])
 @jwt_required()
 def restaurants():
-    user_id = get_jwt_identity()
-    if request.method == 'POST':
-        data = request.get_json()
-        new_restaurant = Restaurant(name=data['name'], user_id=user_id)
-        db.session.add(new_restaurant)
-        db.session.commit()
-        return jsonify({'message': 'Restaurant created successfully'}), 201
-    else:
-        restaurants = Restaurant.query.filter_by(user_id=user_id).all()
-        return jsonify([{'id': r.id, 'name': r.name} for r in restaurants]), 200
-
-@app.route('/api/transactions', methods=['GET', 'POST'])
-@jwt_required()
-def transactions():
-    restaurant_id = request.args.get('restaurant_id')
-    if not restaurant_id:
-        return jsonify({'message': 'Restaurant ID is required'}), 400
-    
-    if request.method == 'POST':
-        data = request.get_json()
-        new_transaction = Transaction(
-            restaurant_id=restaurant_id,
-            date=datetime.strptime(data['date'], '%Y-%m-%d'),
-            amount=data['amount'],
-            currency=data.get('currency', 'USD'),
-            category=data['category'],
-            type=data['type'],
-            description=data.get('description', '')
-        )
-        db.session.add(new_transaction)
-        db.session.commit()
-        return jsonify({'message': 'Transaction added successfully'}), 201
-    else:
-        transactions = Transaction.query.filter_by(restaurant_id=restaurant_id).all()
-        return jsonify([{
-            'id': t.id,
-            'date': t.date.isoformat(),
-            'amount': t.amount,
-            'currency': t.currency,
-            'category': t.category,
-            'type': t.type,
-            'description': t.description,
-            'is_anomaly': t.is_anomaly
-        } for t in transactions]), 200
-
-@app.route('/api/upload', methods=['POST'])
-@jwt_required()
-def upload():
-    user_id = get_jwt_identity()
-    
-    # Get or create restaurant for the user
-    restaurant = Restaurant.query.filter_by(user_id=user_id).first()
-    if not restaurant:
-        # Create a default restaurant if none exists
-        restaurant = Restaurant(name="My Restaurant", user_id=user_id)
+    user_id = int(get_jwt_identity())
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        name = str((data or {}).get("name") or "").strip()
+        if not name:
+            return jsonify({"message": "Restaurant name is required."}), 400
+        restaurant = Restaurant(name=name[:120], user_id=user_id)
         db.session.add(restaurant)
         db.session.commit()
-    Transaction.query.filter_by(restaurant_id=restaurant.id).delete()
-    db.session.commit()
-    if 'file' not in request.files:
-        return jsonify({'message': 'No file uploaded'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'message': 'No file selected'}), 400
-    
-    # Check file extension
-    if not (file.filename.endswith('.xlsx') or file.filename.endswith('.csv')):
-        return jsonify({'message': 'Invalid file type. Please upload a CSV or Excel file.'}), 400
-    
-    try:
-        # Read the file based on extension
-        if file.filename.endswith('.xlsx'):
-            df = pd.read_excel(file)
-        else:
-            df = pd.read_csv(file)
-        
-        # Check for required columns
-        required_columns = ['date', 'amount', 'category', 'type']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            return jsonify({
-                'message': f'Missing required columns: {", ".join(missing_columns)}'
-            }), 400
-        
-        # Process each row
-        success_count = 0
-        error_count = 0
-        errors = []
-        
-        for index, row in df.iterrows():
-            try:
-                # Parse date (handle different formats)
-                date_str = str(row['date']).strip()
-                try:
-                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                except ValueError:
-                    try:
-                        date_obj = datetime.strptime(date_str, '%d/%m/%Y')
-                    except ValueError:
-                        try:
-                            date_obj = datetime.strptime(date_str, '%m/%d/%Y')
-                        except ValueError:
-                            # If all else fails, use today's date
-                            date_obj = datetime.now()
-                            errors.append(f"Row {index+1}: Invalid date format '{date_str}', used today's date")
-                
-                # Create new transaction
-                new_transaction = Transaction(
-                    restaurant_id=restaurant.id,
-                    date=date_obj,
-                    amount=float(row['amount']),
-                    currency=row.get('currency', 'USD'),
-                    category=row['category'].strip().lower(),
-                    type=row['type'].strip(),
-                    description=row.get('description', '')
-                )
-                db.session.add(new_transaction)
-                success_count += 1
-                
-            except Exception as e:
-                error_count += 1
-                errors.append(f"Row {index+1}: {str(e)}")
-        
-        db.session.commit()
-        
-        message = f'Successfully processed {success_count} transactions'
-        if error_count > 0:
-            message += f' with {error_count} errors'
-        
-        return jsonify({
-            'message': message,
-            'success_count': success_count,
-            'error_count': error_count,
-            'errors': errors if errors else None,
-            'restaurant_id': restaurant.id
-        }), 201
-        
-    except Exception as e:
-        db.session.rollback()
-        print(f"Upload error: {str(e)}")
-        return jsonify({'message': f'Error processing file: {str(e)}'}), 400
+        return jsonify(
+            {"id": restaurant.id, "name": restaurant.name, "message": "Restaurant created."}
+        ), 201
 
-@app.route('/api/visualizations/', methods=['GET'])
+    items = Restaurant.query.filter_by(user_id=user_id).order_by(Restaurant.created_at).all()
+    return jsonify([{"id": item.id, "name": item.name} for item in items]), 200
+
+
+@app.route("/api/transactions", methods=["GET", "POST"])
+@jwt_required()
+def transactions():
+    restaurant = owned_restaurant(request.args.get("restaurant_id"), get_jwt_identity())
+    if not restaurant:
+        return jsonify({"message": "Restaurant not found."}), 404
+
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"message": "A JSON request body is required."}), 400
+        try:
+            values = parse_transaction(data)
+        except (TypeError, ValueError) as error:
+            return jsonify({"message": str(error)}), 400
+        transaction = Transaction(restaurant_id=restaurant.id, **values)
+        db.session.add(transaction)
+        db.session.commit()
+        return jsonify(serialize_transaction(transaction)), 201
+
+    items = Transaction.query.filter_by(restaurant_id=restaurant.id).order_by(Transaction.date).all()
+    return jsonify([serialize_transaction(item) for item in items]), 200
+
+
+@app.get("/api/restaurants/<int:restaurant_id>/transactions.csv")
+@jwt_required()
+def export_transactions(restaurant_id):
+    restaurant = owned_restaurant(restaurant_id, get_jwt_identity())
+    if not restaurant:
+        return jsonify({"message": "Restaurant not found."}), 404
+
+    items = Transaction.query.filter_by(restaurant_id=restaurant.id).order_by(Transaction.date).all()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "date",
+            "amount",
+            "currency",
+            "exchange_rate_to_ngn",
+            "category",
+            "type",
+            "description",
+        ]
+    )
+    for item in items:
+        writer.writerow(
+            [
+                item.date.strftime("%Y-%m-%d"),
+                item.amount,
+                item.currency,
+                item.exchange_rate_to_ngn,
+                item.category,
+                item.type,
+                item.description or "",
+            ]
+        )
+
+    filename = f"{secure_filename(restaurant.name) or 'restaurant'}-transactions.csv"
+    return send_file(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+@app.post("/api/upload")
+@jwt_required()
+def upload():
+    upload_file = request.files.get("file")
+    if not upload_file or not upload_file.filename:
+        return jsonify({"message": "Choose a CSV or XLSX file to upload."}), 400
+    try:
+        rows = read_uploaded_rows(upload_file)
+    except (ValueError, StopIteration, InvalidFileException, zipfile.BadZipFile) as error:
+        return jsonify({"message": str(error)}), 400
+    if not rows:
+        return jsonify({"message": "The file contains no transaction rows."}), 400
+    if len(rows) > 50000:
+        return jsonify({"message": "A single import is limited to 50,000 rows."}), 400
+
+    transactions_to_insert = []
+    errors = []
+    for row_number, row in enumerate(rows, start=2):
+        if not any(value is not None and str(value).strip() for value in row.values()):
+            continue
+        try:
+            transactions_to_insert.append(parse_transaction(row))
+        except (TypeError, ValueError) as error:
+            errors.append(f"Row {row_number}: {error}")
+    if errors:
+        return jsonify(
+            {
+                "message": "No rows were imported. Correct the listed data and try again.",
+                "errors": errors[:50],
+                "error_count": len(errors),
+            }
+        ), 422
+    if not transactions_to_insert:
+        return jsonify({"message": "The file contains no transaction rows."}), 400
+
+    user_id = int(get_jwt_identity())
+    restaurant_id = request.form.get("restaurant_id", "").strip()
+    if restaurant_id:
+        restaurant = owned_restaurant(restaurant_id, user_id)
+        if not restaurant:
+            return jsonify({"message": "Restaurant not found."}), 404
+    else:
+        restaurant = Restaurant.query.filter_by(user_id=user_id).order_by(
+            Restaurant.created_at
+        ).first()
+        if not restaurant:
+            restaurant = Restaurant(name="My Restaurant", user_id=user_id)
+            db.session.add(restaurant)
+            db.session.flush()
+
+    db.session.add_all(
+        Transaction(restaurant_id=restaurant.id, **values)
+        for values in transactions_to_insert
+    )
+    db.session.commit()
+    return jsonify(
+        {
+            "message": f"Imported {len(transactions_to_insert)} transactions into {restaurant.name}.",
+            "success_count": len(transactions_to_insert),
+            "error_count": 0,
+            "restaurant_id": restaurant.id,
+        }
+    ), 201
+
+
+@app.get("/api/visualizations")
+@app.get("/api/visualizations/")
 @jwt_required()
 def visualizations():
-    try:
-        restaurant_id = request.args.get('restaurant_id')
-        
-        if not restaurant_id:
-            return jsonify({'error': 'restaurant_id is required'}), 400
-
-        # Verify restaurant exists and belongs to user
-        restaurant = Restaurant.query.filter_by(
-            id=restaurant_id,
-            user_id=get_jwt_identity()
-        ).first()
-        
-        if not restaurant:
-            return jsonify({'error': 'Restaurant not found'}), 404
-
-        # Get transactions
-        transactions = Transaction.query.filter_by(
-            restaurant_id=restaurant.id
-        ).all()
-        
-        if not transactions:
-            return jsonify({
-                'message': 'No transactions found',
-                'waterfall': {'revenue': 0, 'expenses': 0, 'net_cash': 0},
-                'revenue_breakdown': {},
-                'expense_breakdown': {},
-                'monthly_trends': {'revenue': {}, 'expense': {}},
-                'anomalies': [],
-                'company_vs_franchise': {'Company Revenue': 0, 'Franchise Revenue': 0},
-                'eps_dividend': {'months': [], 'eps': [], 'dividends': []},
-                'statistical_summary': {
-                    'avg_monthly_revenue': 0,
-                    'revenue_growth_rate': 0,
-                    'expense_to_revenue_ratio': 0,
-                    'anomaly_percentage': 0
-                }
-            }), 200
-        
-        # Prepare data for visualizations
-        df_data = []
-        for t in transactions:
-            df_data.append({
-                'id': t.id,
-                'date': t.date,
-                'amount': t.amount,
-                'category': t.category,
-                'type': t.type,
-                'is_anomaly': t.is_anomaly
-            })
-        
-        # Convert the data to a DataFrame for processing
-        import pandas as pd
-        df = pd.DataFrame(df_data)
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Generate visualizations
-        visualizations = {}
-        
-        # 1. Cash Flow Overview (Waterfall)
-        revenue = df[df['category'] == 'revenue']['amount'].sum()
-        expenses = df[df['category'] == 'expense']['amount'].sum()
-        net_cash = revenue - expenses
-        visualizations['waterfall'] = {
-            'revenue': float(revenue),
-            'expenses': float(expenses),
-            'net_cash': float(net_cash)
-        }
-        
-        # 2. Revenue Breakdown
-        revenue_df = df[df['category'] == 'revenue']
-        revenue_by_type = revenue_df.groupby('type')['amount'].sum().to_dict()
-        visualizations['revenue_breakdown'] = {k: float(v) for k, v in revenue_by_type.items()}
-        
-        # 3. Expense Breakdown
-        expense_df = df[df['category'] == 'expense']
-        expense_by_type = expense_df.groupby('type')['amount'].sum().to_dict()
-        visualizations['expense_breakdown'] = {k: float(v) for k, v in expense_by_type.items()}
-        
-        # 4. Monthly Trends
-        df['month'] = df['date'].dt.to_period('M').astype(str)
-        monthly_revenue = df[df['category'] == 'revenue'].groupby('month')['amount'].sum().to_dict()
-        monthly_expense = df[df['category'] == 'expense'].groupby('month')['amount'].sum().to_dict()
-        visualizations['monthly_trends'] = {
-            'revenue': {k: float(v) for k, v in monthly_revenue.items()},
-            'expense': {k: float(v) for k, v in monthly_expense.items()}
-        }
-        
-        # 5. Anomalies
-        anomalies = detect_anomalies(transactions)
-        visualizations['anomalies'] = [{
-            'id': a['id'],
-            'amount': float(a['amount']),
-            'date': a['date'].isoformat() if hasattr(a['date'], 'isoformat') else str(a['date']),
-            'category': a['category'],
-            'type': a['type'],
-            'reason': a['reason']
-        } for a in anomalies]
-        
-        # 6. Company vs Franchise Revenue - IMPROVED CALCULATION
-        company_revenue = 0
-        franchise_revenue = 0
-        
-        for t in transactions:
-            if t.category == 'revenue':
-                # Check if transaction type indicates franchise revenue
-                if t.type and any(keyword in t.type.lower() for keyword in ['franchise', 'royalty', 'license', 'franchisee']):
-                    franchise_revenue += t.amount
-                else:
-                    company_revenue += t.amount
-        
-        visualizations['company_vs_franchise'] = {
-            'Company Revenue': float(company_revenue),
-            'Franchise Revenue': float(franchise_revenue)
-        }
-        
-        # 7. EPS & Dividend Data - NEW CALCULATION
-        eps_dividend_data = {
-            'months': [],
-            'eps': [],
-            'dividends': []
-        }
-        
-        # Calculate EPS and dividends from monthly data
-        if monthly_revenue:
-            months = sorted(monthly_revenue.keys())
-            eps_dividend_data['months'] = months
-            
-            for month in months:
-                month_rev = monthly_revenue.get(month, 0)
-                month_exp = monthly_expense.get(month, 0)
-                net_income = month_rev - month_exp
-                
-                # Simplified calculations (adjust as needed for your business logic)
-                # EPS = Net Income / Number of Shares (assuming 1000 shares for demonstration)
-                eps = net_income / 1000 if net_income > 0 else 0
-                
-                # Dividends = 30% of Net Income (adjust percentage as needed)
-                dividends = net_income * 0.3 if net_income > 0 else 0
-                
-                eps_dividend_data['eps'].append(float(eps))
-                eps_dividend_data['dividends'].append(float(dividends))
-        
-        visualizations['eps_dividend'] = eps_dividend_data
-        
-        # 8. Statistical Summary Data
-        avg_monthly_revenue = sum(monthly_revenue.values()) / len(monthly_revenue) if monthly_revenue else 0
-        
-        revenue_growth = 0
-        if len(monthly_revenue) >= 2:
-            months = sorted(monthly_revenue.keys())
-            recent_rev = monthly_revenue[months[-1]]
-            previous_rev = monthly_revenue[months[-2]]
-            revenue_growth = ((recent_rev - previous_rev) / previous_rev * 100) if previous_rev > 0 else 0
-        
-        expense_ratio = (expenses / revenue * 100) if revenue > 0 else 0
-        
-        total_transactions = len(transactions)
-        anomaly_percentage = (len(anomalies) / total_transactions * 100) if total_transactions > 0 else 0
-        
-        visualizations['statistical_summary'] = {
-            'avg_monthly_revenue': float(avg_monthly_revenue),
-            'revenue_growth_rate': float(revenue_growth),
-            'expense_to_revenue_ratio': float(expense_ratio),
-            'anomaly_percentage': float(anomaly_percentage)
-        }
-        
-        return jsonify(visualizations), 200
-
-    except Exception as e:
-        print(f"Error in visualizations endpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
-        
-@app.route('/api/generate_report', methods=['POST'])
-@jwt_required()
-def generate_report():
-    user_id = get_jwt_identity()
-    
-    # Get the user's first restaurant
-    restaurant = Restaurant.query.filter_by(user_id=user_id).first()
+    restaurant = owned_restaurant(request.args.get("restaurant_id"), get_jwt_identity())
     if not restaurant:
-        return jsonify({'message': 'No restaurant found for user'}), 400
-    
-    data = request.get_json()
-    report_type = data.get('report_type', 'comprehensive')
-    
-    # Get transactions data
-    transactions = Transaction.query.filter_by(restaurant_id=restaurant.id).all()
-    
-    # Generate PDF report
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story = []
-    
-    # Add title
-    story.append(Paragraph(f"{restaurant.name} - Comprehensive Financial Report", styles['Title']))
-    story.append(Spacer(1, 12))
-    
-    # Add basic info
-    story.append(Paragraph(f"Report Type: {report_type}", styles['Heading2']))
-    story.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
-    story.append(Spacer(1, 12))
-    
-    # Add summary cards image if available
-    if data.get('summary_cards_image'):
-        try:
-            summary_img_data = data['summary_cards_image'].split(',')[1]
-            summary_img = Image(BytesIO(base64.b64decode(summary_img_data)))
-            summary_img.drawHeight = 100
-            summary_img.drawWidth = 400
-            story.append(Paragraph("Financial Summary", styles['Heading2']))
-            story.append(summary_img)
-            story.append(Spacer(1, 12))
-        except Exception as e:
-            print(f"Error processing summary cards image: {e}")
-            # Fallback to text summary
-            story.append(Paragraph("Financial Summary", styles['Heading2']))
-            summary_data = data.get('summary_data', {})
-            story.append(Paragraph(f"Total Revenue: {summary_data.get('totalRevenue', '₦0.00')}", styles['Normal']))
-            story.append(Paragraph(f"Total Expenses: {summary_data.get('totalExpenses', '₦0.00')}", styles['Normal']))
-            story.append(Paragraph(f"Net Income: {summary_data.get('netIncome', '₦0.00')}", styles['Normal']))
-            story.append(Paragraph(f"Profit Margin: {summary_data.get('profitMargin', '0%')}", styles['Normal']))
-            story.append(Spacer(1, 12))
-    
-    # Add chart images if available
-    chart_images = data.get('chart_images', {})
-    if chart_images:
-        story.append(Paragraph("Financial Charts", styles['Heading2']))
-        story.append(Spacer(1, 12))
-        
-        # Define chart order and titles
-        chart_config = [
-            {'id': 'waterfallChart', 'title': 'Cash Flow Overview'},
-            {'id': 'revenueChart', 'title': 'Revenue Breakdown'},
-            {'id': 'expenseChart', 'title': 'Expense Breakdown'},
-            {'id': 'trendsChart', 'title': 'Monthly Trends'},
-            {'id': 'detailedRevenueChart', 'title': 'Detailed Revenue Breakdown'},
-            {'id': 'companyFranchiseChart', 'title': 'Company vs Franchise Revenue'},
-            {'id': 'profitabilityChart', 'title': 'Profitability Analysis'},
-            {'id': 'epsDividendChart', 'title': 'EPS & Dividend Trends'}
-        ]
-        
-        for chart in chart_config:
-            if chart['id'] in chart_images:
-                try:
-                    img_data = chart_images[chart['id']].split(',')[1]
-                    img = Image(BytesIO(base64.b64decode(img_data)))
-                    img.drawHeight = 150
-                    img.drawWidth = 400
-                    story.append(Paragraph(chart['title'], styles['Heading3']))
-                    story.append(img)
-                    story.append(Spacer(1, 12))
-                except Exception as e:
-                    print(f"Error processing {chart['id']} image: {e}")
-                    story.append(Paragraph(f"{chart['title']}: Could not be included", styles['Normal']))
-    
-    # Add statistical summary image if available
-    if data.get('statistical_summary_image'):
-        try:
-            statistical_img_data = data['statistical_summary_image'].split(',')[1]
-            statistical_img = Image(BytesIO(base64.b64decode(statistical_img_data)))
-            statistical_img.drawHeight = 120
-            statistical_img.drawWidth = 400
-            story.append(Paragraph("Statistical Summary", styles['Heading2']))
-            story.append(statistical_img)
-            story.append(Spacer(1, 12))
-        except Exception as e:
-            print(f"Error processing statistical summary image: {e}")
-            # Fallback to text summary
-            story.append(Paragraph("Statistical Summary", styles['Heading2']))
-            summary_data = data.get('summary_data', {})
-            story.append(Paragraph(f"Average Monthly Revenue: {summary_data.get('avgMonthlyRevenue', '₦0.00')}", styles['Normal']))
-            story.append(Paragraph(f"Revenue Growth Rate: {summary_data.get('revenueGrowthRate', '0%')}", styles['Normal']))
-            story.append(Paragraph(f"Expense to Revenue Ratio: {summary_data.get('expenseToRevenue', '0%')}", styles['Normal']))
-            story.append(Paragraph(f"Anomaly Percentage: {summary_data.get('anomalyPercentage', '0%')}", styles['Normal']))
-            story.append(Spacer(1, 12))
-    
-    # Add visualizations data if available
-    if data.get('visualizations'):
-        viz = data['visualizations']
-        story.append(Paragraph("Financial Data Details", styles['Heading2']))
-        story.append(Spacer(1, 12))
-        
-        # Waterfall chart data
-        story.append(Paragraph("Cash Flow Overview", styles['Heading3']))
-        story.append(Paragraph(f"Revenue: ₦{float(viz['waterfall']['revenue']):,.2f}", styles['Normal']))
-        story.append(Paragraph(f"Expenses: ₦{float(viz['waterfall']['expenses']):,.2f}", styles['Normal']))
-        story.append(Paragraph(f"Net Cash: ₦{float(viz['waterfall']['net_cash']):,.2f}", styles['Normal']))
-        story.append(Spacer(1, 12))
-        
-        # Revenue breakdown
-        if viz.get('revenue_breakdown'):
-            story.append(Paragraph("Revenue Breakdown", styles['Heading3']))
-            for category, amount in viz['revenue_breakdown'].items():
-                story.append(Paragraph(f"{category}: ₦{float(amount):,.2f}", styles['Normal']))
-            story.append(Spacer(1, 12))
-        
-        # Expense breakdown
-        if viz.get('expense_breakdown'):
-            story.append(Paragraph("Expense Breakdown", styles['Heading3']))
-            for category, amount in viz['expense_breakdown'].items():
-                story.append(Paragraph(f"{category}: ₦{float(amount):,.2f}", styles['Normal']))
-            story.append(Spacer(1, 12))
-        
-        # Monthly trends
-        if viz.get('monthly_trends'):
-            story.append(Paragraph("Monthly Trends", styles['Heading3']))
-            months = list(viz['monthly_trends']['revenue'].keys())
-            for month in months:
-                rev = viz['monthly_trends']['revenue'].get(month, 0)
-                exp = viz['monthly_trends']['expense'].get(month, 0)
-                story.append(Paragraph(f"{month}: Revenue ₦{float(rev):,.2f}, Expenses ₦{float(exp):,.2f}", styles['Normal']))
-            story.append(Spacer(1, 12))
-    
-    # Add anomalies if available
-    anomalies = data.get('anomalies', [])
-    if anomalies:
-        story.append(Paragraph("Anomaly Detection", styles['Heading2']))
-        story.append(Paragraph(f"Total Anomalies Detected: {len(anomalies)}", styles['Heading3']))
-        
-        # Add anomalies table HTML if available
-        anomalies_table_html = data.get('anomalies_table')
-        if anomalies_table_html:
-            # If HTML table is provided, add a note (actual table will be created below)
-            story.append(Paragraph("Anomalies details are included in the table below:", styles['Normal']))
-            story.append(Spacer(1, 12))
-        
-        # Create a table for anomalies
-        from reportlab.platypus import Table, TableStyle
-        from reportlab.lib import colors
-        
-        anomaly_data = [['Date', 'Category', 'Type', 'Amount', 'Reason']]
-        for anomaly in anomalies:
-            # Handle date parsing
-            anomaly_date = "Unknown date"
-            try:
-                if 'date' in anomaly:
-                    if isinstance(anomaly['date'], str):
-                        try:
-                            # Try ISO format
-                            date_obj = datetime.fromisoformat(anomaly['date'].replace('Z', '+00:00'))
-                            anomaly_date = date_obj.strftime('%Y-%m-%d')
-                        except ValueError:
-                            try:
-                                # Try parsing as RFC 1123 format
-                                date_obj = datetime.strptime(anomaly['date'], '%a, %d %b %Y %H:%M:%S %Z')
-                                anomaly_date = date_obj.strftime('%Y-%m-%d')
-                            except ValueError:
-                                anomaly_date = anomaly['date'][:10] if len(anomaly['date']) >= 10 else anomaly['date']
-            except:
-                anomaly_date = "Invalid date"
-            
-            anomaly_data.append([
-                anomaly_date,
-                anomaly['category'],
-                anomaly['type'],
-                f"₦{float(anomaly['amount']):,.2f}",
-                anomaly['reason']
-            ])
-        
-        # Create table with appropriate size
-        table_style = TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('FONTSIZE', (0, 1), (-1, -1), 6),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ])
-        
-        # Adjust table width based on number of columns
-        col_widths = [60, 60, 60, 60, 120]  # Adjust as needed
-        
-        anomaly_table = Table(anomaly_data, colWidths=col_widths)
-        anomaly_table.setStyle(table_style)
-        story.append(anomaly_table)
-        story.append(Spacer(1, 12))
-    
-    doc.build(story)
-    buffer.seek(0)
-    
-    # Save report to database
-    new_report = Report(
-        restaurant_id=restaurant.id,
-        report_type=report_type,
-        content=f"Generated {report_type} report"
-    )
-    db.session.add(new_report)
-    db.session.commit()
-    
-    return send_file(
+        return jsonify({"message": "Restaurant not found."}), 404
+    items = Transaction.query.filter_by(restaurant_id=restaurant.id).order_by(Transaction.date).all()
+    result = analyze_transactions(items)
+    result["restaurant"] = {"id": restaurant.id, "name": restaurant.name}
+    return jsonify(result), 200
+
+
+def build_report_pdf(restaurant, transactions, analysis):
+    buffer = io.BytesIO()
+    document = SimpleDocTemplate(
         buffer,
-        as_attachment=True,
-        download_name=f'comprehensive_report_{datetime.now().strftime("%Y%m%d")}.pdf',
-        mimetype='application/pdf'
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title=f"{restaurant['name']} cash-flow analysis",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DashboardTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#143b2b"),
+        spaceAfter=5 * mm,
+    )
+    story = [
+        Paragraph(f"{escape(restaurant['name'])} — Cash-flow analysis", title_style),
+        Paragraph(f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')}", styles["Normal"]),
+        Spacer(1, 5 * mm),
+    ]
+
+    totals = analysis["waterfall"]
+    kpi_rows = [
+        ["Revenue (NGN)", "Expenses (NGN)", "Net cash (NGN)", "Transactions"],
+        [
+            f"NGN {totals['revenue']:,.2f}",
+            f"NGN {totals['expenses']:,.2f}",
+            f"NGN {totals['net_cash']:,.2f}",
+            str(len(transactions)),
+        ],
+    ]
+    kpi_table = Table(kpi_rows, colWidths=[43 * mm] * 4)
+    kpi_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#143b2b")),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 8),
+                ("FONTSIZE", (0, 1), (-1, 1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
+            ]
+        )
+    )
+    story.extend([kpi_table, Spacer(1, 6 * mm)])
+
+    trends = analysis["monthly_trends"]
+    if trends["months"]:
+        story.append(Paragraph("Monthly cash flow (NGN)", styles["Heading2"]))
+        drawing = Drawing(500, 205)
+        chart = VerticalBarChart()
+        chart.x = 52
+        chart.y = 35
+        chart.height = 145
+        chart.width = 420
+        chart.data = [trends["revenue"], trends["expense"]]
+        chart.categoryAxis.categoryNames = trends["months"]
+        chart.categoryAxis.labels.fontSize = 7
+        chart.valueAxis.labelTextFormat = "%.0f"
+        chart.valueAxis.labels.fontSize = 7
+        chart.valueAxis.valueMin = min(0, min(trends["net_cash"], default=0))
+        chart.bars[0].fillColor = colors.HexColor("#21865b")
+        chart.bars[1].fillColor = colors.HexColor("#e28559")
+        chart.groupSpacing = 8
+        chart.barSpacing = 2
+        chart.categoryAxis.labels.angle = 25
+        drawing.add(chart)
+        story.extend([drawing, Spacer(1, 5 * mm)])
+
+    for heading, breakdown in (
+        ("Revenue by source (NGN)", analysis["revenue_breakdown"]),
+        ("Expenses by category (NGN)", analysis["expense_breakdown"]),
+    ):
+        story.append(Paragraph(heading, styles["Heading2"]))
+        rows = [["Type", "Amount (NGN)"]] + [
+            [Paragraph(escape(key), styles["BodyText"]), f"NGN {amount:,.2f}"]
+            for key, amount in breakdown.items()
+        ]
+        if len(rows) == 1:
+            rows.append(["No transactions", "NGN 0.00"])
+        table = Table(rows, colWidths=[125 * mm, 45 * mm], repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
+                    ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        story.extend([table, Spacer(1, 5 * mm)])
+
+    summary = analysis["statistical_summary"]
+    story.append(Paragraph("Operating summary", styles["Heading2"]))
+    growth = summary["revenue_growth_rate"]
+    growth_text = "Not available" if growth is None else f"{growth:.2f}%"
+    story.append(
+        Paragraph(
+            f"Average monthly revenue: NGN {summary['avg_monthly_revenue']:,.2f}<br/>"
+            f"Latest-month revenue change: {growth_text}<br/>"
+            f"Expenses as a share of revenue: {summary['expense_to_revenue_ratio']:.2f}%<br/>"
+            f"Unusual transactions flagged: {summary['anomaly_count']} "
+            f"({summary['anomaly_percentage']:.2f}%)",
+            styles["BodyText"],
+        )
     )
 
-@app.route('/api/logout', methods=['POST'])
+    story.extend([Spacer(1, 5 * mm), Paragraph("Anomaly review", styles["Heading2"])])
+    anomaly_rows = [["Date", "Category / type", "Recorded amount", "NGN equivalent"]]
+    for anomaly in analysis["anomalies"][:100]:
+        anomaly_rows.append(
+            [
+                anomaly["date"][:10],
+                Paragraph(
+                    f"{escape(anomaly['category'].title())} / {escape(anomaly['type'])}",
+                    styles["BodyText"],
+                ),
+                f"{anomaly['currency']} {anomaly['amount']:,.2f}",
+                f"NGN {anomaly['amount_ngn']:,.2f}",
+            ]
+        )
+    if len(anomaly_rows) == 1:
+        anomaly_rows.append(["No anomalies detected", "", "", ""])
+    anomaly_table = Table(
+        anomaly_rows,
+        colWidths=[28 * mm, 54 * mm, 43 * mm, 45 * mm],
+        repeatRows=1,
+    )
+    anomaly_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    story.append(anomaly_table)
+    document.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+@app.route("/api/generate_report", methods=["POST"])
+@app.route("/api/restaurants/<int:restaurant_id>/report.pdf", methods=["GET"])
 @jwt_required()
-def logout():
-    response = jsonify({'message': 'Successfully logged out'})
-    # Clear the JWT cookie
-    response.set_cookie(
-        'access_token_cookie',
-        '',
-        expires=0,
-        httponly=True,
-        secure=False,  # True in production with HTTPS
-        samesite='Lax'
-    )
-    return response, 200    
+def generate_report(restaurant_id=None):
+    if restaurant_id is None:
+        data = request.get_json(silent=True) or {}
+        restaurant_id = data.get("restaurant_id") or request.args.get("restaurant_id", "")
+    restaurant = owned_restaurant(restaurant_id, get_jwt_identity())
+    if not restaurant:
+        return jsonify({"message": "Restaurant not found."}), 404
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True)
+    items = Transaction.query.filter_by(restaurant_id=restaurant.id).order_by(Transaction.date).all()
+    analysis = analyze_transactions(items)
+    pdf = build_report_pdf(
+        {"name": restaurant.name},
+        [
+            {
+                "date": item.date,
+                "amount": item.amount,
+                "currency": item.currency,
+                "exchange_rate_to_ngn": item.exchange_rate_to_ngn,
+                "amount_ngn": item.amount_ngn,
+                "category": item.category,
+                "type": item.type,
+            }
+            for item in items
+        ],
+        analysis,
+    )
+    filename = f"{secure_filename(restaurant.name) or 'restaurant'}-cash-flow-analysis.pdf"
+    return send_file(pdf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=False)

@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+backend/venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.vercel/
+.netlify/
+dist/
+*.db
+*.sqlite
