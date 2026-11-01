@@ -680,13 +680,14 @@ def upload():
             db.session.add(restaurant)
             db.session.flush()
 
-    db.session.execute(
-        insert(Transaction),
-        [
-            {"restaurant_id": restaurant.id, **values}
-            for values in transactions_to_insert
-        ],
-    )
+    transaction_rows = [
+        {"restaurant_id": restaurant.id, **values}
+        for values in transactions_to_insert
+    ]
+    for offset in range(0, len(transaction_rows), 100):
+        db.session.execute(
+            insert(Transaction).values(transaction_rows[offset : offset + 100])
+        )
     db.session.commit()
     return jsonify(
         {
