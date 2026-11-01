@@ -67,7 +67,7 @@ CSV and XLSX files need these columns:
 | `exchange_rate_to_ngn` | For non-NGN | Naira per one unit of the transaction currency; NGN is always treated as rate `1` |
 | `description` | No | Optional transaction note |
 
-Each import is validated before any rows are saved; an invalid row rejects the entire import and the dashboard displays example row errors. Valid transactions are saved in batches and analyzed immediately. Imports append records. Anomaly review compares amounts within groups that share category, transaction type, and currency. Groups need at least four records to be evaluated; an anomaly is a review prompt, not proof of an error.
+Each import is validated before any existing rows are removed; an invalid row rejects the entire import and leaves the current dataset unchanged. A successful upload replaces all transactions for the selected restaurant, then analyzes only the new dataset. Download a CSV backup first if you need to preserve the previous dataset. Anomaly review compares amounts within groups that share category, transaction type, and currency. Groups need at least four records to be evaluated; an anomaly is a review prompt, not proof of an error.
 
 ## Project credits
 

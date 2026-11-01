@@ -61,7 +61,9 @@
         <p class="data-guidance">
           Required columns: <code>date</code>, <code>amount</code>, <code>category</code>, <code>type</code>.
           Currency defaults to NGN. For other currencies, include <code>currency</code> and
-          <code>exchange_rate_to_ngn</code> (naira per unit of that currency). Imports append to your data.
+          <code>exchange_rate_to_ngn</code> (naira per unit of that currency). Each successful upload
+          replaces the selected restaurant's dataset; invalid uploads leave it unchanged. Back up
+          transactions first if you need to keep the previous dataset.
         </p>
         <p id="dashboardMessage" class="status-message" role="status" aria-live="polite"></p>
       </section>

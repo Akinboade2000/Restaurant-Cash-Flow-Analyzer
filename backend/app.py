@@ -691,6 +691,9 @@ def upload():
             db.session.add(restaurant)
             db.session.flush()
 
+    Transaction.query.filter_by(restaurant_id=restaurant.id).delete(
+        synchronize_session=False
+    )
     transaction_rows = [
         {"restaurant_id": restaurant.id, **values}
         for values in transactions_to_insert
@@ -700,10 +703,15 @@ def upload():
             insert(Transaction).values(transaction_rows[offset : offset + 100])
         )
     db.session.commit()
+    transaction_count = len(transactions_to_insert)
+    transaction_label = "transaction" if transaction_count == 1 else "transactions"
     return jsonify(
         {
-            "message": f"Imported {len(transactions_to_insert)} transactions into {restaurant.name}.",
-            "success_count": len(transactions_to_insert),
+            "message": (
+                f"Replaced the dataset for {restaurant.name} with "
+                f"{transaction_count} {transaction_label}."
+            ),
+            "success_count": transaction_count,
             "error_count": 0,
             "restaurant_id": restaurant.id,
         }

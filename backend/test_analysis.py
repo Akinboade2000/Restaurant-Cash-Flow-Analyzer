@@ -103,6 +103,9 @@ class AnalysisTests(unittest.TestCase):
                 redirects,
             )
             self.assertTrue((output_path / "dashboard.html").exists())
+            login = (output_path / "login.html").read_text(encoding="utf-8")
+            self.assertIn('href="/"', login)
+            self.assertIn("Back to home page", login)
             self.assertTrue((output_path / "static" / "js" / "script.js").exists())
 
     def test_netlify_build_rejects_missing_api_origin(self):
@@ -326,7 +329,55 @@ class AnalysisTests(unittest.TestCase):
             headers=headers,
         )
         self.assertEqual(uploaded.status_code, 201, uploaded.get_data(as_text=True))
+        self.assertIn("Replaced the dataset", uploaded.json["message"])
         self.assertEqual(uploaded.json["success_count"], 5000)
+
+        initial_analysis = client.get(
+            f"/api/visualizations?restaurant_id={created.json['id']}"
+        )
+        self.assertEqual(initial_analysis.status_code, 200)
+        self.assertEqual(
+            initial_analysis.json["statistical_summary"]["transaction_count"],
+            5000,
+        )
+        self.assertEqual(initial_analysis.json["waterfall"]["revenue"], 4_000_000)
+        self.assertEqual(initial_analysis.json["waterfall"]["expenses"], 2_000_000)
+
+        replacement = client.post(
+            "/api/upload",
+            data={
+                "restaurant_id": str(created.json["id"]),
+                "file": (
+                    io.BytesIO(
+                        b"date,amount,category,type\n"
+                        b"2025-02-01,750,Meat Pie,Income\n"
+                    ),
+                    "replacement.csv",
+                ),
+            },
+            headers=headers,
+        )
+        self.assertEqual(
+            replacement.status_code,
+            201,
+            replacement.get_data(as_text=True),
+        )
+
+        invalid_upload = client.post(
+            "/api/upload",
+            data={
+                "restaurant_id": str(created.json["id"]),
+                "file": (
+                    io.BytesIO(
+                        b"date,amount,category,type\n"
+                        b"not-a-date,invalid,Rent,Expense\n"
+                    ),
+                    "invalid.csv",
+                ),
+            },
+            headers=headers,
+        )
+        self.assertEqual(invalid_upload.status_code, 422)
 
         analysis = client.get(
             f"/api/visualizations?restaurant_id={created.json['id']}"
@@ -334,12 +385,13 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(analysis.status_code, 200)
         self.assertEqual(
             analysis.json["statistical_summary"]["transaction_count"],
-            5000,
+            1,
         )
-        self.assertEqual(analysis.json["waterfall"]["revenue"], 4_000_000)
-        self.assertEqual(analysis.json["waterfall"]["expenses"], 2_000_000)
-        self.assertIn("Chicken and Chips", analysis.json["revenue_breakdown"])
-        self.assertIn("Rent", analysis.json["expense_breakdown"])
+        self.assertEqual(analysis.json["waterfall"]["revenue"], 750)
+        self.assertEqual(analysis.json["waterfall"]["expenses"], 0)
+        self.assertIn("Meat Pie", analysis.json["revenue_breakdown"])
+        self.assertNotIn("Chicken and Chips", analysis.json["revenue_breakdown"])
+        self.assertNotIn("Rent", analysis.json["expense_breakdown"])
 
 
 if __name__ == "__main__":

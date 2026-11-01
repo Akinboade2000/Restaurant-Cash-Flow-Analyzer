@@ -454,7 +454,7 @@ async function logout() {
   try {
     await requestJson("/api/logout", { method: "POST" });
   } finally {
-    window.location.assign("/login");
+    window.location.assign("/");
   }
 }
 
