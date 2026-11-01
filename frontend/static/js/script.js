@@ -35,7 +35,15 @@ async function requestJson(url, options = {}) {
     throw new Error("Please sign in to continue.");
   }
   if (!response.ok) {
-    throw new Error(data.message || `Request failed (${response.status}).`);
+    const message = data.message || `Request failed (${response.status}).`;
+    const rowErrors = Array.isArray(data.errors) ? data.errors : [];
+    const errorCount = Number(data.error_count) || rowErrors.length;
+    const examples = rowErrors.slice(0, 3);
+    const remaining = Math.max(0, errorCount - examples.length);
+    const details = examples.length
+      ? ` ${examples.join(" ")}${remaining ? ` And ${remaining} more row error(s).` : ""}`
+      : "";
+    throw new Error(`${message}${details}`);
   }
   return data;
 }

@@ -122,6 +122,27 @@ class AnalysisTests(unittest.TestCase):
                 }
             )
 
+    def test_income_expense_type_maps_source_category_to_transaction_type(self):
+        income = parse_transaction(
+            {
+                "date": "2025-04-04",
+                "amount": "750",
+                "category": "Meat Pie",
+                "type": "Income",
+            }
+        )
+        expense = parse_transaction(
+            {
+                "date": "2025-01-01",
+                "amount": "25000",
+                "category": "Rent",
+                "type": "Expense",
+            }
+        )
+
+        self.assertEqual((income["category"], income["type"]), ("revenue", "Meat Pie"))
+        self.assertEqual((expense["category"], expense["type"]), ("expense", "Rent"))
+
     def test_analysis_uses_naira_totals_and_flags_comparable_outlier(self):
         amounts = [95, 100, 105, 110, 9000]
         transactions = [
@@ -285,8 +306,13 @@ class AnalysisTests(unittest.TestCase):
         writer = csv.writer(output)
         writer.writerow(["date", "amount", "category", "type"])
         writer.writerows(
-            ["2025-01-01", "1000", "revenue", "dine-in"]
-            for _ in range(5000)
+            (
+                "2025-01-01",
+                "1000" if index % 5 else "2000",
+                "Chicken and Chips" if index % 5 else "Rent",
+                "Income" if index % 5 else "Expense",
+            )
+            for index in range(5000)
         )
         uploaded = client.post(
             "/api/upload",
@@ -310,7 +336,10 @@ class AnalysisTests(unittest.TestCase):
             analysis.json["statistical_summary"]["transaction_count"],
             5000,
         )
-        self.assertEqual(analysis.json["waterfall"]["revenue"], 5_000_000)
+        self.assertEqual(analysis.json["waterfall"]["revenue"], 4_000_000)
+        self.assertEqual(analysis.json["waterfall"]["expenses"], 2_000_000)
+        self.assertIn("Chicken and Chips", analysis.json["revenue_breakdown"])
+        self.assertIn("Rent", analysis.json["expense_breakdown"])
 
 
 if __name__ == "__main__":

@@ -61,13 +61,13 @@ CSV and XLSX files need these columns:
 |---|---|---|
 | `date` | Yes | `YYYY-MM-DD` or `DD/MM/YYYY` |
 | `amount` | Yes | A non-negative numeric amount in the transaction's currency |
-| `category` | Yes | `revenue` or `expense` |
-| `type` | Yes | A comparable sales source or expense category, such as `dine-in`, `delivery`, `ingredients`, or `staff` |
+| `category` | Yes | `revenue` or `expense`; `income`, `sales`, and `expenditure` are also recognized |
+| `type` | Yes | A comparable sales source or expense category, such as `dine-in`, `delivery`, `ingredients`, or `staff`. Files with a product/cost in `category` and `Income`/`Expense` in `type` are also recognized; the product/cost becomes the transaction type. |
 | `currency` | No | Three-letter code; defaults to `NGN` |
 | `exchange_rate_to_ngn` | For non-NGN | Naira per one unit of the transaction currency; NGN is always treated as rate `1` |
 | `description` | No | Optional transaction note |
 
-Each import is validated before any rows are saved; an invalid row rejects the entire import. Imports append records. Anomaly review compares amounts within groups that share category, transaction type, and currency. Groups need at least four records to be evaluated; an anomaly is a review prompt, not proof of an error.
+Each import is validated before any rows are saved; an invalid row rejects the entire import and the dashboard displays example row errors. Valid transactions are saved in batches and analyzed immediately. Imports append records. Anomaly review compares amounts within groups that share category, transaction type, and currency. Groups need at least four records to be evaluated; an anomaly is a review prompt, not proof of an error.
 
 ## Project credits
 

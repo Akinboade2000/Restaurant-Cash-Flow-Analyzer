@@ -221,14 +221,25 @@ def parse_transaction(row):
     if amount < 0:
         raise ValueError("amount cannot be negative")
 
-    category = str(row.get("category") or "").strip().lower()
-    category = {"income": "revenue", "sales": "revenue", "expenditure": "expense"}.get(
-        category, category
-    )
-    if category not in {"revenue", "expense"}:
-        raise ValueError("category must be revenue or expense")
-
-    transaction_type = str(row.get("type") or "").strip()
+    category_aliases = {
+        "income": "revenue",
+        "revenue": "revenue",
+        "sales": "revenue",
+        "expense": "expense",
+        "expenses": "expense",
+        "expenditure": "expense",
+    }
+    source_category = str(row.get("category") or "").strip()
+    source_type = str(row.get("type") or "").strip()
+    category = category_aliases.get(source_category.lower())
+    transaction_type = source_type
+    if category is None:
+        category = category_aliases.get(source_type.lower())
+        transaction_type = source_category
+    if category is None:
+        raise ValueError(
+            "category must be revenue or expense, or type must identify income or expense"
+        )
     if not transaction_type:
         raise ValueError("type is required")
 
