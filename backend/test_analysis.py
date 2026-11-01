@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from reportlab.lib import colors
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -37,6 +39,7 @@ def extract_pdf_streams(pdf_bytes):
 from app import (
     analyze_transactions,
     app,
+    build_category_charts,
     build_report_pdf,
     create_database_settings,
     parse_transaction,
@@ -211,6 +214,13 @@ class AnalysisTests(unittest.TestCase):
             b"Unusual revenue amount",
         ):
             self.assertIn(section, report_content)
+
+        category_charts = build_category_charts(
+            {f"Source {index}": 1000 - index for index in range(25)},
+            colors.HexColor("#21865b"),
+            "No revenue transactions.",
+        )
+        self.assertEqual(len(category_charts), 2)
 
         all_anomalies = [
             {**result["anomalies"][0], "reason": f"Review evidence {index:03d}"}

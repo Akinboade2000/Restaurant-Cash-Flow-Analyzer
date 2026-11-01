@@ -905,17 +905,14 @@ def build_monthly_chart(analysis):
     return drawing
 
 
-def build_category_chart(breakdown, color, empty_label):
+def build_category_charts(breakdown, color, empty_label):
     entries = sorted(breakdown.items(), key=lambda item: item[1], reverse=True)
-    maximum_rows = 20
-    visible_entries = entries[:maximum_rows]
-    height = max(82, 43 + 17 * len(visible_entries))
-    drawing = Drawing(500, height)
-    if not visible_entries:
+    if not entries:
+        drawing = Drawing(500, 82)
         drawing.add(
             String(
                 250,
-                height / 2,
+                41,
                 empty_label,
                 textAnchor="middle",
                 fontName="Helvetica",
@@ -923,56 +920,63 @@ def build_category_chart(breakdown, color, empty_label):
                 fillColor=colors.HexColor("#738078"),
             )
         )
-        return drawing, len(entries)
+        return [drawing]
 
-    max_value = max(float(value) for _, value in visible_entries) or 1
-    label_width, bar_width = 145, 267
-    bar_start = label_width
-    row_height = 17
-    for index, (label, amount) in enumerate(visible_entries):
-        y = height - 23 - index * row_height
-        drawing.add(
-            String(
-                label_width - 8,
-                y + 2,
-                chart_label(label, 24),
-                textAnchor="end",
-                fontName="Helvetica",
-                fontSize=7,
-                fillColor=colors.HexColor("#41574a"),
+    drawings = []
+    rows_per_chart = 24
+    for offset in range(0, len(entries), rows_per_chart):
+        visible_entries = entries[offset : offset + rows_per_chart]
+        height = max(82, 43 + 17 * len(visible_entries))
+        drawing = Drawing(500, height)
+        max_value = max(float(value) for _, value in visible_entries) or 1
+        label_width, bar_width = 145, 267
+        bar_start = label_width
+        row_height = 17
+        for index, (label, amount) in enumerate(visible_entries):
+            y = height - 23 - index * row_height
+            drawing.add(
+                String(
+                    label_width - 8,
+                    y + 2,
+                    chart_label(label, 24),
+                    textAnchor="end",
+                    fontName="Helvetica",
+                    fontSize=7,
+                    fillColor=colors.HexColor("#41574a"),
+                )
             )
-        )
-        drawing.add(
-            Rect(
-                bar_start,
-                y,
-                bar_width,
-                8,
-                fillColor=colors.HexColor("#f0f4f0"),
-                strokeColor=None,
+            drawing.add(
+                Rect(
+                    bar_start,
+                    y,
+                    bar_width,
+                    8,
+                    fillColor=colors.HexColor("#f0f4f0"),
+                    strokeColor=None,
+                )
             )
-        )
-        drawing.add(
-            Rect(
-                bar_start,
-                y,
-                bar_width * float(amount) / max_value,
-                8,
-                fillColor=color,
-                strokeColor=None,
+            drawing.add(
+                Rect(
+                    bar_start,
+                    y,
+                    bar_width * float(amount) / max_value,
+                    8,
+                    fillColor=color,
+                    strokeColor=None,
+                )
             )
-        )
-        drawing.add(
-            String(
-                bar_start + bar_width + 7,
-                y + 1,
-                chart_label(compact_ngn(amount), 13),
-                fontName="Helvetica",
-                fontSize=7,
-                fillColor=colors.HexColor("#41574a"),
+            drawing.add(
+                String(
+                    bar_start + bar_width + 7,
+                    y + 1,
+                    chart_label(compact_ngn(amount), 13),
+                    fontName="Helvetica",
+                    fontSize=7,
+                    fillColor=colors.HexColor("#41574a"),
+                )
             )
-        )
-    return drawing, len(entries)
+        drawings.append(drawing)
+    return drawings
 
 
 def build_report_pdf(restaurant, transactions, analysis):
@@ -1133,19 +1137,16 @@ def build_report_pdf(restaurant, transactions, analysis):
             "No expense transactions.",
         ),
     ):
-        chart, category_count = build_category_chart(breakdown, color, empty_label)
-        graph_title = (
-            f"{heading} (top 20 of {category_count})"
-            if category_count > 20
-            else heading
-        )
-        story.extend(
-            [
-                Paragraph(graph_title, section_style),
-                chart,
-                Spacer(1, 3 * mm),
-            ]
-        )
+        charts = build_category_charts(breakdown, color, empty_label)
+        for index, chart in enumerate(charts):
+            graph_title = heading if index == 0 else f"{heading} (continued)"
+            story.extend(
+                [
+                    Paragraph(graph_title, section_style),
+                    chart,
+                    Spacer(1, 3 * mm),
+                ]
+            )
 
     for heading, breakdown, total in (
         (
