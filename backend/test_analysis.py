@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import os
@@ -254,6 +255,62 @@ class AnalysisTests(unittest.TestCase):
         )
         self.assertEqual(report.status_code, 200)
         self.assertEqual(report.data[:4], b"%PDF")
+
+    def test_upload_bulk_inserts_5000_transactions(self):
+        client = app.test_client()
+        registration = client.post(
+            "/api/register",
+            json={
+                "username": "bulk-import-owner",
+                "email": "bulk-import@example.com",
+                "password": "a-strong-password",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        login = client.post(
+            "/api/login",
+            json={"username": "bulk-import-owner", "password": "a-strong-password"},
+        )
+        self.assertEqual(login.status_code, 200)
+        csrf = client.get_cookie("csrf_access_token").value
+        headers = {"X-CSRF-TOKEN": csrf}
+        created = client.post(
+            "/api/restaurants",
+            json={"name": "Bulk Import Test"},
+            headers=headers,
+        )
+        self.assertEqual(created.status_code, 201)
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["date", "amount", "category", "type"])
+        writer.writerows(
+            ["2025-01-01", "1000", "revenue", "dine-in"]
+            for _ in range(5000)
+        )
+        uploaded = client.post(
+            "/api/upload",
+            data={
+                "restaurant_id": str(created.json["id"]),
+                "file": (
+                    io.BytesIO(output.getvalue().encode("utf-8")),
+                    "transactions.csv",
+                ),
+            },
+            headers=headers,
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.get_data(as_text=True))
+        self.assertEqual(uploaded.json["success_count"], 5000)
+
+        analysis = client.get(
+            f"/api/visualizations?restaurant_id={created.json['id']}"
+        )
+        self.assertEqual(analysis.status_code, 200)
+        self.assertEqual(
+            analysis.json["statistical_summary"]["transaction_count"],
+            5000,
+        )
+        self.assertEqual(analysis.json["waterfall"]["revenue"], 5_000_000)
 
 
 if __name__ == "__main__":

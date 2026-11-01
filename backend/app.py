@@ -30,7 +30,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-from sqlalchemy import inspect, text
+from sqlalchemy import insert, inspect, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
@@ -680,9 +680,12 @@ def upload():
             db.session.add(restaurant)
             db.session.flush()
 
-    db.session.add_all(
-        Transaction(restaurant_id=restaurant.id, **values)
-        for values in transactions_to_insert
+    db.session.execute(
+        insert(Transaction),
+        [
+            {"restaurant_id": restaurant.id, **values}
+            for values in transactions_to_insert
+        ],
     )
     db.session.commit()
     return jsonify(
