@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 import tempfile
@@ -70,6 +71,17 @@ class AnalysisTests(unittest.TestCase):
     def test_vercel_requires_a_persistent_turso_database(self):
         with self.assertRaisesRegex(RuntimeError, "required in Vercel"):
             create_database_settings({"VERCEL": "1"})
+
+    def test_vercel_config_uses_supported_python_function_configuration(self):
+        config_path = Path(__file__).resolve().parents[1] / "vercel.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("builds", config)
+        self.assertEqual(config["routes"][0]["src"], "/api/(.*)")
+        self.assertEqual(
+            config["functions"]["api/index.py"]["includeFiles"],
+            "backend/**",
+        )
 
     def test_netlify_build_generates_static_pages_and_api_proxy(self):
         with tempfile.TemporaryDirectory(prefix="rcf-netlify-tests-") as directory:
