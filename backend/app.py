@@ -22,14 +22,19 @@ from flask_jwt_extended import (
 )
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
-from reportlab.graphics.charts.barcharts import VerticalBarChart
-from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.shapes import Circle, Drawing, Line, Rect, String
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    LongTable,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 from sqlalchemy import insert, inspect, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -731,6 +736,245 @@ def visualizations():
     return jsonify(result), 200
 
 
+def compact_ngn(value):
+    value = float(value or 0)
+    if abs(value) >= 1_000_000_000:
+        return f"NGN {value / 1_000_000_000:.1f}B"
+    if abs(value) >= 1_000_000:
+        return f"NGN {value / 1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"NGN {value / 1_000:.0f}k"
+    return f"NGN {value:,.0f}"
+
+
+def chart_label(value, max_length=26):
+    return str(value).encode("latin-1", "replace").decode("latin-1")[:max_length]
+
+
+def build_monthly_chart(analysis):
+    width, height = 500, 245
+    drawing = Drawing(width, height)
+    trends = analysis["monthly_trends"]
+    months = trends["months"]
+    series = [
+        ("Revenue", trends["revenue"], colors.HexColor("#21865b"), False),
+        ("Expenses", trends["expense"], colors.HexColor("#e28559"), False),
+        ("Net cash flow", trends["net_cash"], colors.HexColor("#5076ad"), False),
+    ]
+    anomaly_by_month = defaultdict(float)
+    for anomaly in analysis["anomalies"]:
+        month = anomaly["date"][:7]
+        anomaly_by_month[month] = max(
+            anomaly_by_month[month], float(anomaly["amount_ngn"])
+        )
+    series.append(
+        (
+            "Largest flagged transaction",
+            [anomaly_by_month.get(month) or None for month in months],
+            colors.HexColor("#bd5948"),
+            True,
+        )
+    )
+
+    left, bottom, plot_width, plot_height = 61, 49, 421, 145
+    all_values = [
+        float(value)
+        for _, values, _, _ in series
+        for value in values
+        if value is not None
+    ]
+    minimum = min([0, *all_values])
+    maximum = max([0, *all_values])
+    if maximum == minimum:
+        maximum = minimum + 1
+
+    for index in range(5):
+        fraction = index / 4
+        y = bottom + fraction * plot_height
+        value = minimum + fraction * (maximum - minimum)
+        drawing.add(
+            Line(
+                left,
+                y,
+                left + plot_width,
+                y,
+                strokeColor=colors.HexColor("#e6ece7"),
+                strokeWidth=0.6,
+            )
+        )
+        drawing.add(
+            String(
+                left - 6,
+                y - 2,
+                chart_label(compact_ngn(value), 12),
+                textAnchor="end",
+                fontName="Helvetica",
+                fontSize=7,
+                fillColor=colors.HexColor("#738078"),
+            )
+        )
+
+    x_positions = [
+        left + (plot_width / 2 if len(months) == 1 else plot_width * index / (len(months) - 1))
+        for index in range(len(months))
+    ]
+    for _, values, color, points_only in series:
+        points = []
+        for index, value in enumerate(values):
+            if value is None:
+                points.append(None)
+                continue
+            y = bottom + (float(value) - minimum) / (maximum - minimum) * plot_height
+            points.append((x_positions[index], y))
+        previous = None
+        for point in points:
+            if point is None:
+                previous = None
+                continue
+            if not points_only and previous is not None:
+                drawing.add(
+                    Line(
+                        previous[0],
+                        previous[1],
+                        point[0],
+                        point[1],
+                        strokeColor=color,
+                        strokeWidth=1.8,
+                    )
+                )
+            drawing.add(
+                Circle(
+                    point[0],
+                    point[1],
+                    3 if points_only else 2,
+                    fillColor=color,
+                    strokeColor=colors.white,
+                    strokeWidth=0.5,
+                )
+            )
+            previous = point
+
+    label_step = max(1, math.ceil(len(months) / 12))
+    for index, month in enumerate(months):
+        if index % label_step:
+            continue
+        try:
+            label = datetime.strptime(month, "%Y-%m").strftime("%b %y")
+        except ValueError:
+            label = month
+        drawing.add(
+            String(
+                x_positions[index],
+                bottom - 17,
+                chart_label(label, 10),
+                textAnchor="middle",
+                fontName="Helvetica",
+                fontSize=7,
+                fillColor=colors.HexColor("#738078"),
+            )
+        )
+
+    legend_x = [61, 143, 226, 324]
+    for x, (label, _, color, points_only) in zip(legend_x, series):
+        if points_only:
+            drawing.add(Circle(x + 3, 224, 3, fillColor=color, strokeColor=color))
+        else:
+            drawing.add(Line(x, 224, x + 8, 224, strokeColor=color, strokeWidth=2))
+        drawing.add(
+            String(
+                x + 12,
+                221,
+                label,
+                fontName="Helvetica",
+                fontSize=7,
+                fillColor=colors.HexColor("#41574a"),
+            )
+        )
+    if not months:
+        drawing.add(
+            String(
+                width / 2,
+                height / 2,
+                "Import transactions to see monthly cash flow.",
+                textAnchor="middle",
+                fontName="Helvetica",
+                fontSize=10,
+                fillColor=colors.HexColor("#738078"),
+            )
+        )
+    return drawing
+
+
+def build_category_chart(breakdown, color, empty_label):
+    entries = sorted(breakdown.items(), key=lambda item: item[1], reverse=True)
+    maximum_rows = 20
+    visible_entries = entries[:maximum_rows]
+    height = max(82, 43 + 17 * len(visible_entries))
+    drawing = Drawing(500, height)
+    if not visible_entries:
+        drawing.add(
+            String(
+                250,
+                height / 2,
+                empty_label,
+                textAnchor="middle",
+                fontName="Helvetica",
+                fontSize=9,
+                fillColor=colors.HexColor("#738078"),
+            )
+        )
+        return drawing, len(entries)
+
+    max_value = max(float(value) for _, value in visible_entries) or 1
+    label_width, bar_width = 145, 267
+    bar_start = label_width
+    row_height = 17
+    for index, (label, amount) in enumerate(visible_entries):
+        y = height - 23 - index * row_height
+        drawing.add(
+            String(
+                label_width - 8,
+                y + 2,
+                chart_label(label, 24),
+                textAnchor="end",
+                fontName="Helvetica",
+                fontSize=7,
+                fillColor=colors.HexColor("#41574a"),
+            )
+        )
+        drawing.add(
+            Rect(
+                bar_start,
+                y,
+                bar_width,
+                8,
+                fillColor=colors.HexColor("#f0f4f0"),
+                strokeColor=None,
+            )
+        )
+        drawing.add(
+            Rect(
+                bar_start,
+                y,
+                bar_width * float(amount) / max_value,
+                8,
+                fillColor=color,
+                strokeColor=None,
+            )
+        )
+        drawing.add(
+            String(
+                bar_start + bar_width + 7,
+                y + 1,
+                chart_label(compact_ngn(amount), 13),
+                fontName="Helvetica",
+                fontSize=7,
+                fillColor=colors.HexColor("#41574a"),
+            )
+        )
+    return drawing, len(entries)
+
+
 def build_report_pdf(restaurant, transactions, analysis):
     buffer = io.BytesIO()
     document = SimpleDocTemplate(
@@ -746,27 +990,81 @@ def build_report_pdf(restaurant, transactions, analysis):
     title_style = ParagraphStyle(
         "DashboardTitle",
         parent=styles["Title"],
-        alignment=TA_CENTER,
         textColor=colors.HexColor("#143b2b"),
         spaceAfter=5 * mm,
     )
+    section_style = ParagraphStyle(
+        "DashboardSection",
+        parent=styles["Heading2"],
+        textColor=colors.HexColor("#143b2b"),
+        spaceBefore=4 * mm,
+        spaceAfter=2 * mm,
+    )
+    body_style = ParagraphStyle(
+        "DashboardBody",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=11,
+    )
+    table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#143b2b")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ]
+    )
+    totals = analysis["waterfall"]
+    summary = analysis["statistical_summary"]
+    growth = summary["revenue_growth_rate"]
+    growth_text = "Not available" if growth is None else f"{growth:.2f}%"
+    profit_margin = (
+        totals["net_cash"] / totals["revenue"] * 100 if totals["revenue"] else 0
+    )
+    dates = []
+    for transaction in transactions:
+        value = (
+            transaction.get("date")
+            if isinstance(transaction, dict)
+            else getattr(transaction, "date", None)
+        )
+        if value is not None:
+            dates.append(value.date() if isinstance(value, datetime) else value)
+    date_range = (
+        f"{min(dates).strftime('%d %b %Y')} - {max(dates).strftime('%d %b %Y')}"
+        if dates
+        else "No transaction dates"
+    )
+    generated_at = datetime.now().strftime("%d %B %Y, %H:%M")
+
     story = [
-        Paragraph(f"{escape(restaurant['name'])} — Cash-flow analysis", title_style),
-        Paragraph(f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')}", styles["Normal"]),
+        Paragraph(
+            f"{escape(restaurant['name'])} — Cash-flow dashboard",
+            title_style,
+        ),
+        Paragraph(
+            f"Analysis period: {escape(date_range)} &nbsp; | &nbsp; "
+            f"Generated: {generated_at} &nbsp; | &nbsp; "
+            f"{len(transactions):,} transactions",
+            body_style,
+        ),
         Spacer(1, 5 * mm),
     ]
 
-    totals = analysis["waterfall"]
     kpi_rows = [
-        ["Revenue (NGN)", "Expenses (NGN)", "Net cash (NGN)", "Transactions"],
+        ["Total revenue", "Total expenses", "Net cash flow", "Profit margin"],
         [
             f"NGN {totals['revenue']:,.2f}",
             f"NGN {totals['expenses']:,.2f}",
             f"NGN {totals['net_cash']:,.2f}",
-            str(len(transactions)),
+            f"{profit_margin:.2f}%",
         ],
     ]
-    kpi_table = Table(kpi_rows, colWidths=[43 * mm] * 4)
+    kpi_table = Table(kpi_rows, colWidths=[44.5 * mm] * 4)
     kpi_table.setStyle(
         TableStyle(
             [
@@ -775,7 +1073,7 @@ def build_report_pdf(restaurant, transactions, analysis):
                 ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, 0), 8),
-                ("FONTSIZE", (0, 1), (-1, 1), 10),
+                ("FONTSIZE", (0, 1), (-1, 1), 9),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
                 ("TOPPADDING", (0, 0), (-1, -1), 8),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
@@ -784,107 +1082,164 @@ def build_report_pdf(restaurant, transactions, analysis):
     )
     story.extend([kpi_table, Spacer(1, 6 * mm)])
 
-    trends = analysis["monthly_trends"]
-    if trends["months"]:
-        story.append(Paragraph("Monthly cash flow (NGN)", styles["Heading2"]))
-        drawing = Drawing(500, 205)
-        chart = VerticalBarChart()
-        chart.x = 52
-        chart.y = 35
-        chart.height = 145
-        chart.width = 420
-        chart.data = [trends["revenue"], trends["expense"]]
-        chart.categoryAxis.categoryNames = trends["months"]
-        chart.categoryAxis.labels.fontSize = 7
-        chart.valueAxis.labelTextFormat = "%.0f"
-        chart.valueAxis.labels.fontSize = 7
-        chart.valueAxis.valueMin = min(0, min(trends["net_cash"], default=0))
-        chart.bars[0].fillColor = colors.HexColor("#21865b")
-        chart.bars[1].fillColor = colors.HexColor("#e28559")
-        chart.groupSpacing = 8
-        chart.barSpacing = 2
-        chart.categoryAxis.labels.angle = 25
-        drawing.add(chart)
-        story.extend([drawing, Spacer(1, 5 * mm)])
-
-    for heading, breakdown in (
-        ("Revenue by source (NGN)", analysis["revenue_breakdown"]),
-        ("Expenses by category (NGN)", analysis["expense_breakdown"]),
-    ):
-        story.append(Paragraph(heading, styles["Heading2"]))
-        rows = [["Type", "Amount (NGN)"]] + [
-            [Paragraph(escape(key), styles["BodyText"]), f"NGN {amount:,.2f}"]
-            for key, amount in breakdown.items()
-        ]
-        if len(rows) == 1:
-            rows.append(["No transactions", "NGN 0.00"])
-        table = Table(rows, colWidths=[125 * mm, 45 * mm], repeatRows=1)
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
-                    ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
-        )
-        story.extend([table, Spacer(1, 5 * mm)])
-
-    summary = analysis["statistical_summary"]
-    story.append(Paragraph("Operating summary", styles["Heading2"]))
-    growth = summary["revenue_growth_rate"]
-    growth_text = "Not available" if growth is None else f"{growth:.2f}%"
-    story.append(
-        Paragraph(
-            f"Average monthly revenue: NGN {summary['avg_monthly_revenue']:,.2f}<br/>"
-            f"Latest-month revenue change: {growth_text}<br/>"
-            f"Expenses as a share of revenue: {summary['expense_to_revenue_ratio']:.2f}%<br/>"
-            f"Unusual transactions flagged: {summary['anomaly_count']} "
+    insight_rows = [
+        ["Average monthly revenue", "Latest-month revenue change"],
+        [f"NGN {summary['avg_monthly_revenue']:,.2f}", growth_text],
+        ["Expenses as a share of revenue", "Unusual transactions"],
+        [
+            f"{summary['expense_to_revenue_ratio']:.2f}%",
+            f"{summary['anomaly_count']:,} "
             f"({summary['anomaly_percentage']:.2f}%)",
-            styles["BodyText"],
+        ],
+    ]
+    insights = Table(insight_rows, colWidths=[89 * mm, 89 * mm])
+    insights.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f6f3")),
+                ("BACKGROUND", (0, 2), (-1, 2), colors.HexColor("#f3f6f3")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#41574a")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 2), (-1, 2), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ]
         )
     )
+    story.extend(
+        [
+            Paragraph("Operating indicators", section_style),
+            insights,
+            Spacer(1, 4 * mm),
+            Paragraph("Monthly cash flow", section_style),
+            build_monthly_chart(analysis),
+            Spacer(1, 3 * mm),
+        ]
+    )
 
-    story.extend([Spacer(1, 5 * mm), Paragraph("Anomaly review", styles["Heading2"])])
-    anomaly_rows = [["Date", "Category / type", "Recorded amount", "NGN equivalent"]]
-    for anomaly in analysis["anomalies"][:100]:
+    for heading, breakdown, color, empty_label in (
+        (
+            "Revenue by source",
+            analysis["revenue_breakdown"],
+            colors.HexColor("#21865b"),
+            "No revenue transactions.",
+        ),
+        (
+            "Expenses by category",
+            analysis["expense_breakdown"],
+            colors.HexColor("#e28559"),
+            "No expense transactions.",
+        ),
+    ):
+        chart, category_count = build_category_chart(breakdown, color, empty_label)
+        graph_title = (
+            f"{heading} (top 20 of {category_count})"
+            if category_count > 20
+            else heading
+        )
+        story.extend(
+            [
+                Paragraph(graph_title, section_style),
+                chart,
+                Spacer(1, 3 * mm),
+            ]
+        )
+
+    for heading, breakdown, total in (
+        (
+            "Revenue breakdown",
+            analysis["revenue_breakdown"],
+            totals["revenue"],
+        ),
+        (
+            "Expense breakdown",
+            analysis["expense_breakdown"],
+            totals["expenses"],
+        ),
+    ):
+        story.extend([Paragraph(heading, section_style)])
+        rows = [["Source / category", "Amount (NGN)", "Share of total"]]
+        rows.extend(
+            [
+                Paragraph(escape(str(key)), body_style),
+                f"NGN {amount:,.2f}",
+                f"{(amount / total * 100) if total else 0:.2f}%",
+            ]
+            for key, amount in sorted(
+                breakdown.items(), key=lambda item: item[1], reverse=True
+            )
+        )
+        if len(rows) == 1:
+            rows.append(["No transactions", "NGN 0.00", "0.00%"])
+        table = LongTable(
+            rows,
+            colWidths=[92 * mm, 48 * mm, 38 * mm],
+            repeatRows=1,
+        )
+        table.setStyle(table_style)
+        table.setStyle(TableStyle([("ALIGN", (1, 1), (-1, -1), "RIGHT")]))
+        story.extend([table, Spacer(1, 4 * mm)])
+
+    story.append(Paragraph("Transactions to check", section_style))
+    story.append(
+        Paragraph(
+            "Flags are review prompts, not proof of an error. Every flagged "
+            "transaction from the current dataset is listed below.",
+            body_style,
+        )
+    )
+    anomaly_rows = [
+        [
+            "Date",
+            "Category",
+            "Type",
+            "Recorded amount",
+            "NGN equivalent",
+            "Why it was flagged",
+        ]
+    ]
+    for anomaly in analysis["anomalies"]:
         anomaly_rows.append(
             [
                 anomaly["date"][:10],
+                Paragraph(escape(str(anomaly["category"]).title()), body_style),
                 Paragraph(
-                    f"{escape(anomaly['category'].title())} / {escape(anomaly['type'])}",
-                    styles["BodyText"],
+                    escape(str(anomaly["type"])),
+                    body_style,
                 ),
                 f"{anomaly['currency']} {anomaly['amount']:,.2f}",
                 f"NGN {anomaly['amount_ngn']:,.2f}",
+                Paragraph(escape(str(anomaly["reason"])), body_style),
             ]
         )
     if len(anomaly_rows) == 1:
-        anomaly_rows.append(["No anomalies detected", "", "", ""])
-    anomaly_table = Table(
+        anomaly_rows.append(["No anomalies detected", "", "", "", "", ""])
+    anomaly_table = LongTable(
         anomaly_rows,
-        colWidths=[28 * mm, 54 * mm, 43 * mm, 45 * mm],
+        colWidths=[21 * mm, 24 * mm, 28 * mm, 31 * mm, 31 * mm, 43 * mm],
         repeatRows=1,
     )
-    anomaly_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3ed")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dce5df")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
+    anomaly_table.setStyle(table_style)
+    anomaly_table.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 7)]))
     story.append(anomaly_table)
-    document.build(story)
+
+    def add_page_number(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#dce5df"))
+        canvas.line(16 * mm, 11 * mm, A4[0] - 16 * mm, 11 * mm)
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#738078"))
+        canvas.drawString(
+            16 * mm,
+            7 * mm,
+            "Restaurant Cash Flow Analyzer - NGN",
+        )
+        canvas.drawRightString(A4[0] - 16 * mm, 7 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
     buffer.seek(0)
     return buffer
 

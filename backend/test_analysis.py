@@ -1,10 +1,13 @@
+import base64
 import csv
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
+import zlib
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +19,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 test_database_directory = tempfile.TemporaryDirectory(prefix="rcf-sqlite-tests-")
 os.environ["DATABASE_PATH"] = str(Path(test_database_directory.name) / "test.sqlite")
 os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-restaurant-analysis"
+
+
+def extract_pdf_streams(pdf_bytes):
+    content = []
+    for stream in re.findall(rb"stream\r?\n(.*?)endstream", pdf_bytes, re.DOTALL):
+        try:
+            encoded = stream.strip()
+            if encoded.endswith(b"~>"):
+                encoded = base64.a85decode(encoded[:-2])
+            content.append(zlib.decompress(encoded))
+        except (ValueError, zlib.error):
+            continue
+    return b"\n".join(content)
+
 
 from app import (
     analyze_transactions,
@@ -183,6 +200,34 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(result["statistical_summary"]["anomaly_count"], 1)
         report = build_report_pdf({"name": "Test Restaurant"}, transactions, result)
         self.assertEqual(report.read(4), b"%PDF")
+        report_content = extract_pdf_streams(report.getvalue())
+        for section in (
+            b"Monthly cash flow",
+            b"Revenue by source",
+            b"Expenses by category",
+            b"Operating indicators",
+            b"Transactions to check",
+            b"Why it was flagged",
+            b"Unusual revenue amount",
+        ):
+            self.assertIn(section, report_content)
+
+        all_anomalies = [
+            {**result["anomalies"][0], "reason": f"Review evidence {index:03d}"}
+            for index in range(1, 102)
+        ]
+        complete_analysis = {
+            **result,
+            "anomalies": all_anomalies,
+            "statistical_summary": {
+                **result["statistical_summary"],
+                "anomaly_count": len(all_anomalies),
+            },
+        }
+        complete_report = build_report_pdf(
+            {"name": "Test Restaurant"}, transactions, complete_analysis
+        ).getvalue()
+        self.assertIn(b"Review evidence 101", extract_pdf_streams(complete_report))
 
     def test_anomaly_detection_waits_for_a_comparable_sample(self):
         transactions = [

@@ -2,6 +2,8 @@
 
 A restaurant cash-flow dashboard with NGN-normalized analysis, transaction anomaly review, CSV/XLSX imports, and downloadable PDF reports. The web UI is a static Netlify site, the Flask API runs on Vercel, and persistent hosted data is stored in a Turso **libSQL** database.
 
+The PDF dashboard report includes the financial indicators, monthly cash-flow chart, revenue and expense category charts, complete category breakdowns, and every flagged transaction with its review reason. Category charts show the top 20 entries when there are more than 20; the accompanying breakdown tables retain every category.
+
 > **Database driver:** `sqlalchemy-libsql` is currently marked experimental by its maintainers and supports Linux/macOS, not Windows. It is installed only in the Vercel Linux runtime. On Windows, the app continues to use a local SQLite file for development.
 
 ## Run locally
