@@ -16,7 +16,7 @@ The PDF dashboard report includes the financial indicators, monthly cash-flow ch
    pip install -r requirements.txt
    ```
 
-2. Copy `.env.example` to `.env` and set a private random `JWT_SECRET_KEY`. By default, the local SQLite database is `backend\instance\restaurant_cashflow.db`.
+2. Copy `.env.example` to `.env` and set a private random `JWT_SECRET_KEY`. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_SENDER` with your email provider's SMTP settings to enable password reset emails. `PUBLIC_APP_URL` is the origin used in reset links; it defaults to the current request origin if unset. By default, the local SQLite database is `backend\instance\restaurant_cashflow.db`.
 3. Start the Flask app from the repository root:
 
    ```powershell
@@ -38,7 +38,11 @@ Vercel uses Python 3.12 as pinned in `.python-version`.
    - `TURSO_AUTH_TOKEN` — the private token generated for that database.
    - `JWT_SECRET_KEY` — a long, unique random secret.
    - `COOKIE_SECURE` — `true`.
+   - `PUBLIC_APP_URL` — the HTTPS origin of your Netlify website.
+   - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_SENDER` — SMTP delivery settings from your email provider. Use the provider's recommended STARTTLS port (usually `587`) and a sender address authorized for that SMTP account.
 4. Redeploy after saving the environment variables. Copy the production Vercel deployment origin, for example `https://your-api.vercel.app`.
+
+The login page's **Forgot your password?** link sends a one-hour, single-use reset link to the registered email address. Configure SMTP before using this feature in production.
 
 The app requires both Turso variables when running on Vercel; it will not silently fall back to a temporary SQLite file there.
 

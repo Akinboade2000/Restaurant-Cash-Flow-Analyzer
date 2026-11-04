@@ -782,6 +782,15 @@ a {
   margin-top: 12px;
 }
 
+.auth-forgot-link {
+  display: block;
+  margin-top: 8px;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
 .auth-switch {
   margin: 20px 0 0 !important;
   text-align: center;
@@ -792,11 +801,17 @@ a {
   font-weight: 700;
 }
 
-.auth-error {
-  color: #ad453e !important;
-  font-size: 13px !important;
+.auth-message {
+  margin: 16px 0 0;
+  color: var(--green-dark);
+  font-size: 13px;
 }
 
+.auth-error {
+  color: #ad453e !important;
+}
+
+.auth-message[hidden],
 .auth-error[hidden] {
   display: none;
 }

@@ -38,7 +38,14 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(source.read_bytes())
 
-    for template_name in ("index", "login", "register", "dashboard"):
+    for template_name in (
+        "index",
+        "login",
+        "register",
+        "forgot_password",
+        "reset_password",
+        "dashboard",
+    ):
         source = (TEMPLATES / f"{template_name}.html").read_text(encoding="utf-8")
         rendered, replacements = STATIC_REFERENCE.subn(
             lambda match: f"/static/{match.group(1)}",
@@ -53,8 +60,10 @@ def main():
     redirects = [
         f"/api/* {api_url}/api/:splat 200",
         "/dashboard /dashboard.html 200",
+        "/forgot-password /forgot_password.html 200",
         "/login /login.html 200",
         "/register /register.html 200",
+        "/reset-password /reset_password.html 200",
     ]
     (OUTPUT / "_redirects").write_text("\n".join(redirects) + "\n", encoding="utf-8")
 

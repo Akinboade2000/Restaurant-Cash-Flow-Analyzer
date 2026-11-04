@@ -16,6 +16,8 @@ let selectedRestaurant = "";
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("loginForm")?.addEventListener("submit", handleLogin);
   document.getElementById("registerForm")?.addEventListener("submit", handleRegister);
+  document.getElementById("forgotPasswordForm")?.addEventListener("submit", handleForgotPassword);
+  document.getElementById("resetPasswordForm")?.addEventListener("submit", handleResetPassword);
   document.getElementById("dashboardContent") && initializeDashboard();
 });
 
@@ -93,6 +95,68 @@ async function handleRegister(event) {
     window.location.assign("/login");
   } catch (error) {
     showAuthError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function handleForgotPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const message = document.getElementById("forgotPasswordMessage");
+  button.disabled = true;
+  message.hidden = true;
+  message.classList.remove("auth-error");
+  try {
+    const result = await requestJson("/api/password-reset/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: document.getElementById("resetEmail").value }),
+    });
+    message.textContent = result.message;
+    message.hidden = false;
+  } catch (error) {
+    message.textContent = error.message;
+    message.classList.add("auth-error");
+    message.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function handleResetPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const message = document.getElementById("resetPasswordMessage");
+  const password = document.getElementById("newPassword").value;
+  message.hidden = true;
+  message.classList.remove("auth-error");
+  if (password !== document.getElementById("confirmPassword").value) {
+    message.textContent = "The passwords do not match.";
+    message.classList.add("auth-error");
+    message.hidden = false;
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    const result = await requestJson("/api/password-reset/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: new URLSearchParams(window.location.search).get("token"),
+        password,
+      }),
+    });
+    message.textContent = `${result.message} Redirecting to sign in...`;
+    message.hidden = false;
+    window.setTimeout(() => window.location.assign("/login"), 1800);
+  } catch (error) {
+    message.textContent = error.message;
+    message.classList.add("auth-error");
+    message.hidden = false;
   } finally {
     button.disabled = false;
   }

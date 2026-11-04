@@ -1,17 +1,22 @@
 import csv
+import hashlib
 import io
 import math
 import os
 import secrets
+import smtplib
+import ssl
 import threading
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
 from html import escape
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, redirect, render_template, request, send_file
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -40,7 +45,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from model import Restaurant, Transaction, User, db
+from model import PasswordResetToken, Restaurant, Transaction, User, db
 
 
 load_dotenv()
@@ -472,6 +477,50 @@ def serialize_transaction(transaction):
     }
 
 
+def send_password_reset_email(email, reset_url):
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("SMTP_SENDER")
+    if not smtp_host or not sender:
+        raise RuntimeError("SMTP_HOST and SMTP_SENDER must be configured.")
+    if bool(smtp_username) != bool(smtp_password):
+        raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD must both be configured.")
+
+    message = EmailMessage()
+    message["Subject"] = "Reset your Restaurant Cash Flow password"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(
+        "We received a request to reset your password. "
+        f"Use this link within one hour: {reset_url}\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+        server.starttls(context=ssl.create_default_context())
+        if smtp_username:
+            server.login(smtp_username, smtp_password)
+        server.send_message(message)
+
+
+def password_reset_url(token):
+    app_url = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
+    if not app_url:
+        app_url = request.host_url.rstrip("/")
+    parsed_url = urlsplit(app_url)
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+        or parsed_url.path
+        or parsed_url.query
+        or parsed_url.fragment
+        or parsed_url.username
+    ):
+        raise RuntimeError("PUBLIC_APP_URL must be an HTTP or HTTPS origin.")
+    return f"{app_url}/reset-password?token={token}"
+
+
 @app.get("/")
 def home():
     return render_template("index.html")
@@ -485,6 +534,19 @@ def login_page():
 @app.get("/register")
 def register_page():
     return render_template("register.html")
+
+
+@app.get("/forgot-password")
+def forgot_password_page():
+    return render_template("forgot_password.html")
+
+
+@app.get("/reset-password")
+def reset_password_page():
+    response = app.make_response(render_template("reset_password.html"))
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @app.get("/dashboard")
@@ -550,6 +612,84 @@ def login():
     )
     set_access_cookies(response, create_access_token(identity=str(user.id)))
     return response, 200
+
+
+@app.post("/api/password-reset/request")
+def request_password_reset():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "A JSON request body is required."}), 400
+    email = str(data.get("email") or "").strip().lower()
+    if not email or len(email) > 120 or "@" not in email:
+        return jsonify({"message": "Enter a valid email address."}), 400
+
+    user = None
+    try:
+        reset_url = password_reset_url("")
+        user = User.query.filter_by(email=email).first()
+        if user:
+            token = secrets.token_urlsafe(32)
+            reset_url = password_reset_url(token)
+            PasswordResetToken.query.filter_by(user_id=user.id).delete(
+                synchronize_session=False
+            )
+            db.session.add(
+                PasswordResetToken(
+                    user_id=user.id,
+                    token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    expires_at=utc_now() + timedelta(hours=1),
+                )
+            )
+            db.session.commit()
+            send_password_reset_email(user.email, reset_url)
+    except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+        db.session.rollback()
+        if user:
+            PasswordResetToken.query.filter_by(user_id=user.id).delete(
+                synchronize_session=False
+            )
+            db.session.commit()
+        app.logger.exception("Unable to send a password reset email.")
+        return jsonify(
+            {"message": "Password reset email could not be sent. Please try again later."}
+        ), 503
+
+    return jsonify(
+        {
+            "message": "If an account exists for that email, a reset link has been sent."
+        }
+    ), 200
+
+
+@app.post("/api/password-reset/confirm")
+def confirm_password_reset():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "A JSON request body is required."}), 400
+    token = str(data.get("token") or "")
+    password = str(data.get("password") or "")
+    if not token:
+        return jsonify({"message": "The password reset link is invalid or expired."}), 400
+    if len(password) < 8:
+        return jsonify({"message": "Password must contain at least 8 characters."}), 400
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    reset_token = PasswordResetToken.query.filter_by(token_hash=token_hash).first()
+    if not reset_token or reset_token.expires_at <= utc_now():
+        return jsonify({"message": "The password reset link is invalid or expired."}), 400
+
+    user = db.session.get(User, reset_token.user_id)
+    if not user:
+        PasswordResetToken.query.filter_by(token_hash=token_hash).delete()
+        db.session.commit()
+        return jsonify({"message": "The password reset link is invalid or expired."}), 400
+
+    user.password = generate_password_hash(password)
+    PasswordResetToken.query.filter_by(user_id=user.id).delete(
+        synchronize_session=False
+    )
+    db.session.commit()
+    return jsonify({"message": "Your password has been updated. You can now sign in."}), 200
 
 
 @app.post("/api/logout")

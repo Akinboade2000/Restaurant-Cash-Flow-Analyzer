@@ -1,5 +1,6 @@
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -8,10 +9,11 @@ import sys
 import tempfile
 import unittest
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 from reportlab.lib import colors
 
@@ -45,7 +47,7 @@ from app import (
     parse_transaction,
 )
 from flask_jwt_extended import create_access_token
-from model import db
+from model import PasswordResetToken, db
 import scripts.build_netlify as netlify_build
 
 
@@ -126,6 +128,10 @@ class AnalysisTests(unittest.TestCase):
             login = (output_path / "login.html").read_text(encoding="utf-8")
             self.assertIn('href="/"', login)
             self.assertIn("Back to home page", login)
+            self.assertTrue((output_path / "forgot_password.html").exists())
+            self.assertTrue((output_path / "reset_password.html").exists())
+            self.assertIn("/forgot-password /forgot_password.html 200", redirects)
+            self.assertIn("/reset-password /reset_password.html 200", redirects)
             self.assertTrue((output_path / "static" / "js" / "script.js").exists())
 
     def test_netlify_build_rejects_missing_api_origin(self):
@@ -269,6 +275,100 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(app.test_client().get("/dashboard").status_code, 401)
+
+    def test_password_reset_email_flow_uses_expiring_single_use_tokens(self):
+        client = app.test_client()
+        reset_page = client.get("/reset-password?token=example")
+        self.assertEqual(reset_page.status_code, 200)
+        self.assertEqual(reset_page.headers["Cache-Control"], "no-store")
+        self.assertEqual(reset_page.headers["Referrer-Policy"], "no-referrer")
+
+        registration = client.post(
+            "/api/register",
+            json={
+                "username": "password-reset-owner",
+                "email": "password-reset@example.com",
+                "password": "old-strong-password",
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+
+        with mock.patch.dict(
+            os.environ, {"PUBLIC_APP_URL": "https://restaurant.example"}
+        ), mock.patch("app.send_password_reset_email") as send_email:
+            unknown_email = client.post(
+                "/api/password-reset/request",
+                json={"email": "unknown@example.com"},
+            )
+            self.assertEqual(unknown_email.status_code, 200)
+            self.assertEqual(
+                unknown_email.json["message"],
+                "If an account exists for that email, a reset link has been sent.",
+            )
+            send_email.assert_not_called()
+
+            request_reset = client.post(
+                "/api/password-reset/request",
+                json={"email": "PASSWORD-RESET@example.com"},
+            )
+
+        self.assertEqual(request_reset.status_code, 200)
+        send_email.assert_called_once()
+        recipient, reset_url = send_email.call_args.args
+        self.assertEqual(recipient, "password-reset@example.com")
+        self.assertTrue(reset_url.startswith("https://restaurant.example/reset-password?"))
+        token = parse_qs(urlsplit(reset_url).query)["token"][0]
+
+        with app.app_context():
+            reset_record = PasswordResetToken.query.one()
+            self.assertEqual(
+                reset_record.token_hash,
+                hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            )
+            reset_record.expires_at = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            ) - timedelta(seconds=1)
+            db.session.commit()
+
+        expired = client.post(
+            "/api/password-reset/confirm",
+            json={"token": token, "password": "new-strong-password"},
+        )
+        self.assertEqual(expired.status_code, 400)
+
+        with app.app_context():
+            reset_record = PasswordResetToken.query.one()
+            reset_record.expires_at = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            ) + timedelta(hours=1)
+            db.session.commit()
+
+        updated = client.post(
+            "/api/password-reset/confirm",
+            json={"token": token, "password": "new-strong-password"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        reused = client.post(
+            "/api/password-reset/confirm",
+            json={"token": token, "password": "another-strong-password"},
+        )
+        self.assertEqual(reused.status_code, 400)
+        old_login = client.post(
+            "/api/login",
+            json={
+                "username": "password-reset-owner",
+                "password": "old-strong-password",
+            },
+        )
+        new_login = client.post(
+            "/api/login",
+            json={
+                "username": "password-reset-owner",
+                "password": "new-strong-password",
+            },
+        )
+        self.assertEqual(old_login.status_code, 401)
+        self.assertEqual(new_login.status_code, 200)
 
     def test_sqlite_registration_upload_analysis_and_pdf_download(self):
         client = app.test_client()
